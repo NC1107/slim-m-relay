@@ -1,0 +1,11 @@
+.git
+.github
+.env
+fcm-service-account.json
+apns-auth-key.p8
+*.p8
+data
+*.db
+*.db-wal
+*.db-shm
+README.md

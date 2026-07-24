@@ -1,0 +1,16 @@
+# Secrets - never commit
+.env
+fcm-service-account.json
+apns-auth-key.p8
+*.p8
+*.json.key
+
+# Local key store and its WAL sidecars
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Build output (root-anchored so it doesn't match the cmd/relay/ source dir)
+/out/
+/relay

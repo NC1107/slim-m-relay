@@ -4,9 +4,10 @@
 // iOS devices, using token-based (.p8 key) authentication via github.com/sideshow/apns2,
 // the standard Go APNs client.
 //
-// Every notification it sends is content-free: aps carries only content-available and
-// mutable-content, never an alert, sound, or badge, so APNs itself - and its logs - never
-// see plaintext. The home server's already-encrypted payload and the coarse kind travel as
+// Every notification it sends is content-free. Kinds that should surface something on a
+// locked device carry a fixed generic alert ("New message"), identical for every sender and
+// channel, so APNs and its logs still never see plaintext; the rest are silent
+// content-available wakes. The home server's already-encrypted payload and the coarse kind travel as
 // custom top-level fields; the device wakes and decrypts locally to decide how, or whether,
 // to surface a notification. push.KindCall is the one exception to "background wake": it
 // goes to the app's separate PushKit topic (the bundle id plus ".voip") as a
@@ -36,6 +37,15 @@ type client interface {
 // time, rather than taking a second operator-supplied value, means the two topics can never
 // drift apart.
 const voipTopicSuffix = ".voip"
+
+// genericAlert maps the kinds that should surface something on a locked device to the
+// fixed text shown for them. The text is deliberately identical for every sender, channel
+// and message: it names nothing, so it is still content-free. A kind absent from this map
+// stays a silent background wake, which is what "wake" is for.
+var genericAlert = map[push.Kind]string{
+	push.KindMessage: "New message",
+	push.KindMention: "You were mentioned",
+}
 
 // Sender holds the APNs token client and posts notifications to the gateway.
 type Sender struct {
@@ -90,7 +100,7 @@ func (s *Sender) Send(ctx context.Context, msgs []push.Message) []push.Result {
 }
 
 func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
-	p := payload.NewPayload().ContentAvailable().MutableContent()
+	p := payload.NewPayload().MutableContent()
 	p.Custom("kind", string(m.Kind))
 	p.Custom("payload", m.Payload)
 
@@ -102,6 +112,18 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 		// (10) unless the payload also triggers a user-visible alert, sound, or badge.
 		Priority: apns2.PriorityLow,
 		Payload:  p,
+	}
+	if alert, ok := genericAlert[m.Kind]; ok {
+		// A fixed string, identical for every message from every sender, so APNs still
+		// learns nothing beyond the coarse kind it already sees. Without an alert the
+		// push is silent, and a device with no Notification Service Extension yet would
+		// show the user nothing at all. mutable-content stays set so that extension can
+		// later decrypt the payload and replace this placeholder in place.
+		p.Alert(alert).Sound("default")
+		n.PushType = apns2.PushTypeAlert
+		n.Priority = apns2.PriorityHigh
+	} else {
+		p.ContentAvailable()
 	}
 	if m.Kind == push.KindCall {
 		// A call must ring the device promptly, so it takes PushKit's separate VoIP topic,

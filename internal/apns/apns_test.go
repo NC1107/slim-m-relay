@@ -53,27 +53,47 @@ func TestSendMapsResponseToStatus(t *testing.T) {
 	}
 }
 
-// Every kind except "call" takes the plain background wake: the bundle id as topic,
-// PushTypeBackground, and low priority.
-func TestSendUsesBundleIDAsTopicAndBackgroundPushType(t *testing.T) {
-	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindWake} {
+// Only "wake" stays a silent background push: the bundle id as topic, PushTypeBackground,
+// and low priority.
+func TestSendWakeKindUsesSilentBackgroundPush(t *testing.T) {
+	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+	s := &Sender{client: fc, bundleID: "com.example.app"}
+	s.Send(context.Background(), []push.Message{{Token: "tok", Kind: push.KindWake, Payload: "cipher"}})
+
+	if len(fc.got) != 1 {
+		t.Fatalf("got %d notifications, want 1", len(fc.got))
+	}
+	n := fc.got[0]
+	if n.Topic != "com.example.app" {
+		t.Errorf("topic = %q, want the configured bundle id", n.Topic)
+	}
+	if n.PushType != apns2.PushTypeBackground {
+		t.Errorf("push type = %q, want background", n.PushType)
+	}
+	if n.Priority != apns2.PriorityLow {
+		t.Errorf("priority = %d, want PriorityLow (a background push must not use high priority)", n.Priority)
+	}
+}
+
+// A message or mention must actually surface on a locked device, which a
+// content-available-only push never does. Both take an alert push on the plain bundle id
+// topic at high priority.
+func TestSendMessageKindsUseAlertPush(t *testing.T) {
+	for _, kind := range []push.Kind{push.KindMessage, push.KindMention} {
 		t.Run(string(kind), func(t *testing.T) {
 			fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
 			s := &Sender{client: fc, bundleID: "com.example.app"}
 			s.Send(context.Background(), []push.Message{{Token: "tok", Kind: kind, Payload: "cipher"}})
 
-			if len(fc.got) != 1 {
-				t.Fatalf("got %d notifications, want 1", len(fc.got))
-			}
 			n := fc.got[0]
 			if n.Topic != "com.example.app" {
 				t.Errorf("topic = %q, want the configured bundle id", n.Topic)
 			}
-			if n.PushType != apns2.PushTypeBackground {
-				t.Errorf("push type = %q, want background", n.PushType)
+			if n.PushType != apns2.PushTypeAlert {
+				t.Errorf("push type = %q, want alert so the device shows something", n.PushType)
 			}
-			if n.Priority != apns2.PriorityLow {
-				t.Errorf("priority = %d, want PriorityLow (a background push must not use high priority)", n.Priority)
+			if n.Priority != apns2.PriorityHigh {
+				t.Errorf("priority = %d, want PriorityHigh for a user-visible alert", n.Priority)
 			}
 		})
 	}
@@ -102,39 +122,68 @@ func TestSendCallKindUsesVoipTopicAndPushType(t *testing.T) {
 	}
 }
 
-// The payload must never carry a plaintext alert, sound, or badge - only the
-// content-available background flag and the opaque, already-encrypted fields.
+// The payload must never carry anything derived from the message. A visible alert is
+// allowed, but only the fixed generic string: it must be byte-identical regardless of the
+// sender, channel, or text, so APNs learns nothing it did not already know from the kind.
 func TestSendPayloadIsContentFree(t *testing.T) {
-	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
-	s := &Sender{client: fc, bundleID: "com.example.app"}
-	s.Send(context.Background(), []push.Message{{Token: "tok", Kind: push.KindMention, Payload: "opaque-ciphertext"}})
+	send := func(kind push.Kind, payload string) string {
+		fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+		s := &Sender{client: fc, bundleID: "com.example.app"}
+		s.Send(context.Background(), []push.Message{{Token: "tok", Kind: kind, Payload: payload}})
+		raw, err := json.Marshal(fc.got[0].Payload)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return string(raw)
+	}
 
-	raw, err := json.Marshal(fc.got[0].Payload)
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
+	// Two different messages in the same channel from different senders must produce
+	// byte-identical alert text.
+	a := send(push.KindMessage, "ciphertext-one")
+	b := send(push.KindMessage, "totally-different-ciphertext")
+	extractAlert := func(body string) string {
+		var d struct {
+			Aps struct {
+				Alert string `json:"alert"`
+			} `json:"aps"`
+		}
+		if err := json.Unmarshal([]byte(body), &d); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return d.Aps.Alert
 	}
-	body := string(raw)
-	if strings.Contains(body, "alert") {
-		t.Errorf("payload must never contain an alert:\n%s", body)
+	if extractAlert(a) != extractAlert(b) {
+		t.Errorf("alert text varies between messages (%q vs %q); it must be a fixed string",
+			extractAlert(a), extractAlert(b))
 	}
+	if extractAlert(a) != "New message" {
+		t.Errorf("alert = %q, want the fixed generic string", extractAlert(a))
+	}
+
+	body := send(push.KindMention, "opaque-ciphertext")
 	var decoded struct {
 		Aps struct {
-			ContentAvailable int `json:"content-available"`
-			MutableContent   int `json:"mutable-content"`
+			Alert          string `json:"alert"`
+			MutableContent int    `json:"mutable-content"`
 		} `json:"aps"`
 		Kind    string `json:"kind"`
 		Payload string `json:"payload"`
 	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
-	if decoded.Aps.ContentAvailable != 1 {
-		t.Errorf("content-available = %d, want 1", decoded.Aps.ContentAvailable)
+	// mutable-content is what lets a Notification Service Extension replace the generic
+	// text with the decrypted content on-device; without it the placeholder is permanent.
+	if decoded.Aps.MutableContent != 1 {
+		t.Errorf("mutable-content = %d, want 1", decoded.Aps.MutableContent)
 	}
 	if decoded.Kind != "mention" {
 		t.Errorf("kind = %q, want mention", decoded.Kind)
 	}
 	if decoded.Payload != "opaque-ciphertext" {
 		t.Errorf("payload = %q, want the opaque ciphertext forwarded untouched", decoded.Payload)
+	}
+	if strings.Contains(body, "opaque-ciphertext\"") && strings.Count(body, "opaque-ciphertext") != 1 {
+		t.Errorf("ciphertext appears more than once in the payload:\n%s", body)
 	}
 }

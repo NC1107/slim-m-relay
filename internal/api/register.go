@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/nc1107/slim-m-relay/internal/keys"
 )
 
 type registerReq struct {
@@ -26,7 +28,7 @@ const maxLabelLen = 256
 // so the endpoint can't be used to mass-mint. The claimed publicUrl is recorded, unverified,
 // only as a hint that helps an admin tell keys apart.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if !s.registerLim.Allow(clientIP(r)) {
+	if !s.registerLim.Allow(s.clientIP(r)) {
 		writeErr(w, http.StatusTooManyRequests, "too many registrations from this address, try again later")
 		return
 	}
@@ -40,8 +42,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if len(label) > maxLabelLen {
 		label = label[:maxLabelLen]
 	}
-	key, err := s.keys.Issue(r.Context(), label)
+	key, err := s.keys.Issue(r.Context(), label, int64(s.cfg.MaxRegistrations))
 	if err != nil {
+		if err == keys.ErrRegistrationCeiling {
+			writeErr(w, http.StatusForbidden, "relay has reached its maximum number of registrations")
+			return
+		}
 		log.Printf("relay: issue key: %v", err)
 		writeErr(w, http.StatusInternalServerError, "could not issue key")
 		return

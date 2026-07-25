@@ -22,6 +22,10 @@ type Server struct {
 	keys        *keys.Store
 	registerLim *ratelimit.Limiter
 	sendLim     *ratelimit.Limiter
+	// callLim is a tighter, separate per-key budget for "call" kind messages specifically -
+	// a call rings a device, making it the most abusable kind - on top of sendLim's general
+	// per-key fan-out budget.
+	callLim *ratelimit.Limiter
 }
 
 // New constructs a Server. ios and android are the platform senders /v1/send dispatches to
@@ -35,6 +39,7 @@ func New(cfg config.Config, ios, android push.Sender, store *keys.Store) *Server
 		keys:        store,
 		registerLim: ratelimit.New(float64(cfg.RegisterPerHour)/60.0, cfg.RegisterBurst),
 		sendLim:     ratelimit.New(float64(cfg.SendPerMinute), cfg.SendBurst),
+		callLim:     ratelimit.New(float64(cfg.CallSendPerMinute), cfg.CallSendBurst),
 	}
 }
 

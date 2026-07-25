@@ -33,6 +33,86 @@ func TestKeysAreIndependent(t *testing.T) {
 	}
 }
 
+// Every keyed limiter (per-IP registration, per-key send, per-key call) is built from this
+// same Limiter, so its idle sweep is what keeps all of them from growing without bound as
+// distinct IPs and keys come and go.
+func TestEvictsIdleBuckets(t *testing.T) {
+	l := New(60, 1)
+	if !l.Allow("stale-a") || !l.Allow("stale-b") {
+		t.Fatal("setup: both keys should be allowed on their first call")
+	}
+
+	l.mu.Lock()
+	if len(l.buckets) != 2 {
+		t.Fatalf("setup: want 2 buckets before eviction, got %d", len(l.buckets))
+	}
+	// Age both buckets past evictIdle's 10-minute cutoff, and force the next Allow to treat
+	// evictInterval as elapsed, so the sweep runs deterministically instead of waiting on
+	// real wall-clock time.
+	old := time.Now().Add(-11 * time.Minute)
+	l.buckets["stale-a"].last = old
+	l.buckets["stale-b"].last = old
+	l.lastEvict = time.Now().Add(-2 * evictInterval)
+	l.mu.Unlock()
+
+	if !l.Allow("fresh") {
+		t.Fatal("a new key should be allowed regardless of the sweep")
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.buckets["stale-a"]; ok {
+		t.Error("stale-a should have been evicted as idle")
+	}
+	if _, ok := l.buckets["stale-b"]; ok {
+		t.Error("stale-b should have been evicted as idle")
+	}
+	if _, ok := l.buckets["fresh"]; !ok {
+		t.Error("fresh should still be present; eviction must not remove active buckets")
+	}
+	if len(l.buckets) != 1 {
+		t.Errorf("want exactly 1 bucket after eviction, got %d", len(l.buckets))
+	}
+}
+
+// Return undoes a prior Allow, so a caller that consumed a token for work it turns out
+// never happened - a not_attempted call-kind send, for instance - can give it back rather
+// than leaving a subsequent legitimate retry wrongly refused.
+func TestReturnGivesBackAToken(t *testing.T) {
+	l := New(0, 1)
+	if !l.Allow("k") {
+		t.Fatal("first call should be allowed within the burst of 1")
+	}
+	if l.Allow("k") {
+		t.Fatal("second call should be denied: the burst is spent")
+	}
+	l.Return("k")
+	if !l.Allow("k") {
+		t.Fatal("after Return, a call should be allowed again")
+	}
+}
+
+// Return must never push a bucket's tokens above its burst ceiling.
+func TestReturnDoesNotExceedBurst(t *testing.T) {
+	l := New(0, 1)
+	l.Return("never-called-allow") // no bucket yet: must be a harmless no-op
+	if !l.Allow("never-called-allow") {
+		t.Fatal("first call for a key with no prior bucket should still be allowed")
+	}
+
+	l.mu.Lock()
+	l.buckets["k"] = &bucket{tokens: 1, last: time.Now()}
+	l.mu.Unlock()
+	l.Return("k")
+	l.Return("k")
+	l.mu.Lock()
+	got := l.buckets["k"].tokens
+	l.mu.Unlock()
+	if got != 1 {
+		t.Errorf("tokens = %v after returning past a full bucket, want capped at burst (1)", got)
+	}
+}
+
 func TestRefillsOverTime(t *testing.T) {
 	// 60/min = 1/sec. Spend the single-token burst, then hand the bucket a second of
 	// elapsed time by moving its last-seen back, and it should allow again.

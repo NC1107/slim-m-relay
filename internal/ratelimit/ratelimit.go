@@ -64,6 +64,23 @@ func (l *Limiter) Allow(key string) bool {
 	return false
 }
 
+// Return gives back one token to key's bucket, undoing a prior Allow that turned out not to
+// be needed - for example a message that consumed a tighter per-key budget (like the call
+// kind's) but was then never attempted before the request's deadline fired. It is a no-op
+// for a key with no bucket yet, since that means Allow was never called for it.
+func (l *Limiter) Return(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		return
+	}
+	b.tokens++
+	if b.tokens > l.burst {
+		b.tokens = l.burst
+	}
+}
+
 // evictIdle removes buckets untouched for 10 minutes. Must be called with l.mu held.
 func (l *Limiter) evictIdle(now time.Time) {
 	cutoff := now.Add(-10 * time.Minute)

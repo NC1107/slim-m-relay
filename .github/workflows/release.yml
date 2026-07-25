@@ -39,15 +39,15 @@ jobs:
     env:
       IMAGE: ghcr.io/nc1107/slim-m-relay
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         id: build
         with:
           context: .
@@ -62,7 +62,7 @@ jobs:
           mkdir -p /tmp/digests
           echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: relay-image-digest-${{ matrix.arch }}
           path: /tmp/digests/${{ matrix.arch }}
@@ -87,14 +87,14 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: relay-image-digest-*
           path: /tmp/digests
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -119,7 +119,7 @@ jobs:
           digest="$(docker buildx imagetools inspect "${IMAGE}:${version}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
-      - uses: sigstore/cosign-installer@v4.1.2
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: cosign sign (keyless)
         run: cosign sign --yes "${IMAGE}@${{ steps.manifest.outputs.digest }}"

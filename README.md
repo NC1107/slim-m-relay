@@ -27,28 +27,31 @@ It does not log tokens or payload content, only counts and error codes.
 
 1. A slim-m server boots with a relay URL configured.
 2. If it has no key yet, it calls `POST /v1/register` with its public URL.
-   The relay mints a key (registration is per-IP rate-limited) and returns it once, recording the public URL as an admin label.
+   The relay mints a key (registration is per-IP rate-limited, and bounded overall by `RELAY_MAX_REGISTRATIONS`) and returns it once, recording the public URL as an admin label.
    The server stores the key and reuses it forever after.
 3. When something happens worth waking a device for, the server calls `POST /v1/send` with its key and a batch of `{platform, token, kind, payload}`.
-   The relay forwards each message to APNs or FCM depending on its platform, and returns a per-token result so the server can prune tokens the provider reports as dead.
+   The relay forwards each message to APNs or FCM depending on its platform, through a bounded worker pool under a hard per-request deadline, and returns a per-token result so the server can prune tokens the provider reports as dead.
+   A message the deadline cut off before its turn comes back as `not_attempted` rather than any other status, so the server knows to retry only those.
 
 Keys are stored as SHA-256 hashes in a small SQLite file, so a leak of the database yields nothing usable.
-Registration is rate-limited per IP and sending is rate-limited per key.
+Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`, and sending is rate-limited per key, with a tighter limit specifically on `call` kind pushes since a call rings a device and is the most abusable kind.
+Rate limiting is per-instance and in-process: it lives in the relay's own memory, not a shared store, so running more than one replica multiplies the effective limits rather than sharing one budget across them.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
 
 ### Token-to-key binding
 
-Because device tokens are opaque strings that a server could in principle send to any registered token, the relay adds one hardening rule beyond scoped keys: the first key to send to a given `(platform, token)` pair becomes that token's owner, permanently, in the same SQLite store.
+Because device tokens are opaque strings that a server could in principle send to any registered token, the relay adds one hardening rule beyond scoped keys: the first key to send to a given `(platform, token)` pair becomes that token's owner in the same SQLite store, for as long as that key keeps sending to it.
 Every later send to that token must come from the same key.
 A send from a different key for a token it does not own is rejected with `forbidden`, and never reaches APNs or FCM.
 This keeps one self-hosted server from harassing another server's devices, even if it somehow obtained their tokens.
+A binding its owner has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
 
 ## API
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | `POST` | `/v1/register` | none (IP rate-limited) | Mint a key. Optional body `{"publicUrl": "..."}` is recorded, unverified, as an admin label. |
-| `POST` | `/v1/send` | `Authorization: Bearer <key>` | Forward `{"messages": [{"platform","token","kind","payload"}]}` to APNs or FCM by platform. Returns `{"results": [{"token","status"}]}` where status is `delivered`, `unregistered`, `forbidden`, or `error`. |
+| `POST` | `/v1/send` | `Authorization: Bearer <key>` | Forward `{"messages": [{"platform","token","kind","payload"}]}` to APNs or FCM by platform. Returns `{"results": [{"token","status"}]}` where status is `delivered`, `unregistered`, `forbidden`, `not_attempted`, or `error`. |
 | `GET` | `/healthz` | none | Liveness. |
 | `GET` | `/admin/keys` | `Authorization: Bearer <admin token>` | List issued keys (metadata only). |
 | `POST` | `/admin/keys/{id}/revoke` | `Authorization: Bearer <admin token>` | Revoke a key. |
@@ -58,6 +61,7 @@ Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set.
 `platform` is `ios` or `android`.
 `kind` is `message`, `mention`, `call`, or `wake`.
 `payload` is the home server's already-encrypted blob, forwarded byte-for-byte; the relay never inspects it.
+`kind: "call"` is the one kind that changes how the push is delivered: on iOS it goes to the app's separate `<bundle id>.voip` PushKit topic at high priority instead of the plain background-wake topic, so the app needs the matching VoIP Services entitlement configured with Apple for it to ring.
 
 ## Running it
 
@@ -83,7 +87,10 @@ docker run -d \
 ```
 
 Put the relay behind whatever reverse proxy you already run (Caddy, Traefik, nginx).
-The relay reads the client IP from `X-Forwarded-For`, which a trusted proxy sets, so per-IP registration limits stay accurate.
+By default the relay ignores `X-Forwarded-For` entirely and keys per-IP rate limiting on the raw socket address, since every proxy the list above sets that header at *appends* its view of the peer - the leftmost entry is always whatever the client itself sent, and trusting it by default would let any caller spoof its way to an unlimited number of rate-limit identities.
+If you do run behind such a proxy and want registration limits keyed on the real client rather than the proxy's own address, set `RELAY_TRUST_PROXY=true`.
+The relay then reads the rightmost entry of `X-Forwarded-For`, the one hop the trusted proxy itself appended and the only one an external caller cannot forge.
+Enabling it without a real proxy in front that sets the header makes the limiter spoofable, so only turn it on once you have confirmed your proxy is the one setting `X-Forwarded-For`, not passing a client-supplied value through unchanged.
 The `/data` volume holds the SQLite key store; back it up, since losing it means every registered server re-registers on its next boot, and every device token re-establishes its binding to whichever server sends to it first.
 
 ## Configuration
@@ -97,13 +104,20 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_APNS_KEY_PATH` | *(empty)* | Path to the APNs `.p8` token key. |
 | `RELAY_APNS_KEY_ID` | *(empty)* | The `.p8` key's 10-character key id. |
 | `RELAY_APNS_TEAM_ID` | *(empty)* | Apple Developer Team ID. |
-| `RELAY_APNS_BUNDLE_ID` | *(empty)* | App bundle id, used as the APNs topic. |
+| `RELAY_APNS_BUNDLE_ID` | *(empty)* | App bundle id, used as the APNs background-wake topic. A `call` kind push is derived from it as `<bundle id>.voip`, so this one value configures both topics and they can never drift apart. |
 | `RELAY_APNS_PRODUCTION` | `true` | `true` for APNs' production gateway, `false` for the sandbox gateway. All four `RELAY_APNS_*` credential fields are required together; if any is empty, iOS sends fail clearly. |
+| `RELAY_TRUST_PROXY` | `false` | `true` reads the client IP from the rightmost entry of `X-Forwarded-For`, for use behind a reverse proxy that sets it. `false` (default) always uses the raw socket address. Enabling this without a real proxy in front makes per-IP rate limiting spoofable. |
 | `RELAY_REGISTER_PER_HOUR` | `5` | Per-IP registration rate. |
 | `RELAY_REGISTER_BURST` | `3` | Per-IP registration burst. |
+| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will ever mint, across every IP, forever (revoked keys still count against it). Zero or negative disables the ceiling. |
 | `RELAY_SEND_PER_MINUTE` | `120` | Per-key send rate. |
 | `RELAY_SEND_BURST` | `60` | Per-key send burst. |
+| `RELAY_CALL_SEND_PER_MINUTE` | `10` | Per-key rate specifically for `call` kind pushes, tighter than `RELAY_SEND_PER_MINUTE` since a call rings a device and is the most abusable kind. |
+| `RELAY_CALL_SEND_BURST` | `5` | Per-key burst for `call` kind pushes. |
 | `RELAY_MAX_MESSAGES` | `500` | Device tokens allowed in one `/v1/send`. |
+| `RELAY_SEND_CONCURRENCY` | `8` | Provider sends run at once, per `/v1/send` request, through a bounded worker pool. |
+| `RELAY_SEND_TIMEOUT_SECONDS` | `20` | Hard wall-clock deadline for one `/v1/send` request's provider dispatch. A message not yet attempted when it fires comes back as `not_attempted`. `0` or negative disables the deadline entirely rather than expiring it instantly. |
+| `RELAY_TOKEN_RETENTION_DAYS` | `90` | How long a device-token binding may go without its owning key sending to it before it is pruned. A send always refreshes the clock, so an actively used token is never at risk. `0` or negative disables pruning, leaving the tokens table to grow without bound. |
 
 ## Development
 

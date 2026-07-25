@@ -53,7 +53,36 @@ func TestSendMapsResponseToStatus(t *testing.T) {
 	}
 }
 
+// Every kind except "call" takes the plain background wake: the bundle id as topic,
+// PushTypeBackground, and low priority.
 func TestSendUsesBundleIDAsTopicAndBackgroundPushType(t *testing.T) {
+	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindWake} {
+		t.Run(string(kind), func(t *testing.T) {
+			fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+			s := &Sender{client: fc, bundleID: "com.example.app"}
+			s.Send(context.Background(), []push.Message{{Token: "tok", Kind: kind, Payload: "cipher"}})
+
+			if len(fc.got) != 1 {
+				t.Fatalf("got %d notifications, want 1", len(fc.got))
+			}
+			n := fc.got[0]
+			if n.Topic != "com.example.app" {
+				t.Errorf("topic = %q, want the configured bundle id", n.Topic)
+			}
+			if n.PushType != apns2.PushTypeBackground {
+				t.Errorf("push type = %q, want background", n.PushType)
+			}
+			if n.Priority != apns2.PriorityLow {
+				t.Errorf("priority = %d, want PriorityLow (a background push must not use high priority)", n.Priority)
+			}
+		})
+	}
+}
+
+// A "call" kind must ring the device: it takes the separate ".voip" PushKit topic,
+// PushTypeVOIP, and high priority, derived from the one configured bundle id rather than a
+// second operator-supplied value.
+func TestSendCallKindUsesVoipTopicAndPushType(t *testing.T) {
 	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
 	s := &Sender{client: fc, bundleID: "com.example.app"}
 	s.Send(context.Background(), []push.Message{{Token: "tok", Kind: push.KindCall, Payload: "cipher"}})
@@ -62,14 +91,14 @@ func TestSendUsesBundleIDAsTopicAndBackgroundPushType(t *testing.T) {
 		t.Fatalf("got %d notifications, want 1", len(fc.got))
 	}
 	n := fc.got[0]
-	if n.Topic != "com.example.app" {
-		t.Errorf("topic = %q, want the configured bundle id", n.Topic)
+	if n.Topic != "com.example.app.voip" {
+		t.Errorf("topic = %q, want the bundle id with .voip appended", n.Topic)
 	}
-	if n.PushType != apns2.PushTypeBackground {
-		t.Errorf("push type = %q, want background", n.PushType)
+	if n.PushType != apns2.PushTypeVOIP {
+		t.Errorf("push type = %q, want voip", n.PushType)
 	}
-	if n.Priority != apns2.PriorityLow {
-		t.Errorf("priority = %d, want PriorityLow (a background push must not use high priority)", n.Priority)
+	if n.Priority != apns2.PriorityHigh {
+		t.Errorf("priority = %d, want PriorityHigh (10) for a call push", n.Priority)
 	}
 }
 

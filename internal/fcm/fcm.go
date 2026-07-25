@@ -30,6 +30,15 @@ const (
 	endpoint = "https://fcm.googleapis.com"
 )
 
+// maxErrorBodyBytes bounds how much of an error response sendOne reads to classify a
+// failure. FCM v1 pretty-prints its error JSON by default, and a real INVALID_ARGUMENT
+// body naming a malformed registration token runs to several hundred bytes on its own; a
+// tighter cap risks truncating it mid-document, which makes json.Unmarshal fail, which
+// makes tokenFieldViolation return false, which misclassifies a dead token as StatusError
+// (retried forever) instead of StatusUnregistered. 16 KiB comfortably holds any real
+// provider error while still bounding memory per response.
+const maxErrorBodyBytes = 16 * 1024
+
 // Sender holds the FCM credentials and posts messages to the REST API.
 type Sender struct {
 	tokens    oauth2.TokenSource
@@ -40,6 +49,14 @@ type Sender struct {
 
 // New builds a Sender from a Firebase service-account JSON.
 func New(ctx context.Context, credentialsJSON []byte) (*Sender, error) {
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	// The oauth2.TokenSource interface's Token() takes no context or per-call deadline, so
+	// the only way to bound how long a token refresh can block is the http.Client captured
+	// in the context CredentialsFromJSON is given here - that client is what every future
+	// refresh through creds.TokenSource uses, for the lifetime of the Sender. Without this,
+	// a blackholed token endpoint hangs Token() forever on http.DefaultClient, which has no
+	// timeout, and no per-request deadline can ever cut that off.
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
 	creds, err := google.CredentialsFromJSON(ctx, credentialsJSON, scope)
 	if err != nil {
 		return nil, fmt.Errorf("parse FCM credentials: %w", err)
@@ -50,7 +67,7 @@ func New(ctx context.Context, credentialsJSON []byte) (*Sender, error) {
 	return &Sender{
 		tokens:    creds.TokenSource,
 		projectID: creds.ProjectID,
-		http:      &http.Client{Timeout: 15 * time.Second},
+		http:      httpClient,
 		endpoint:  endpoint,
 	}, nil
 }
@@ -63,7 +80,7 @@ func (s *Sender) ProjectID() string { return s.projectID }
 // payload; the caller decides what to record from the returned statuses.
 func (s *Sender) Send(ctx context.Context, msgs []push.Message) []push.Result {
 	results := make([]push.Result, len(msgs))
-	tok, err := s.tokens.Token()
+	tok, err := s.token(ctx)
 	if err != nil {
 		for i, m := range msgs {
 			results[i] = push.Result{Token: m.Token, Status: push.StatusError}
@@ -75,6 +92,32 @@ func (s *Sender) Send(ctx context.Context, msgs []push.Message) []push.Result {
 		results[i] = push.Result{Token: m.Token, Status: s.sendOne(ctx, url, tok.AccessToken, m)}
 	}
 	return results
+}
+
+// token fetches an access token bounded by ctx. oauth2.TokenSource.Token() itself takes no
+// context and so cannot be interrupted directly - that is what let a blackholed OAuth token
+// endpoint hold a /v1/send request open past its configured deadline regardless of how the
+// deadline was enforced elsewhere. Running the fetch in its own goroutine and racing it
+// against ctx.Done() is what makes the caller's deadline actually cut this off. If ctx wins,
+// the goroutine is simply abandoned rather than killed - Go has no way to do that - but it
+// can never run past New's http.Client timeout, so it still finishes and exits on its own,
+// its result silently discarded into the buffered channel.
+func (s *Sender) token(ctx context.Context) (*oauth2.Token, error) {
+	type result struct {
+		tok *oauth2.Token
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		tok, err := s.tokens.Token()
+		ch <- result{tok, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.tok, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message) push.Status {
@@ -106,11 +149,30 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 	if resp.StatusCode < 300 {
 		return push.StatusDelivered
 	}
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	if resp.StatusCode == http.StatusBadRequest && tokenFieldViolation(raw) {
+		// Live FCM v1 reports a malformed or corrupt registration token as HTTP 400
+		// INVALID_ARGUMENT with a BadRequest field violation naming "message.token", not as
+		// the 404 UNREGISTERED the docs lead you to expect. Left unmapped this reads as
+		// StatusError (worth a retry) and the caller would resend to a token that can never
+		// succeed. A 400 from some other field - a malformed payload or message body - is a
+		// server bug and must stay StatusError.
+		return push.StatusUnregistered
+	}
 	if errorCode(raw) == "UNREGISTERED" {
 		return push.StatusUnregistered
 	}
 	return push.StatusError
+}
+
+// fcmErrorDetail is one entry of an FCM v1 error's "details" array. The same array carries
+// two different detail shapes depending on the failure - errorCode for the FCM-specific
+// reason, fieldViolations for a google.rpc.BadRequest - so both are read from one struct.
+type fcmErrorDetail struct {
+	ErrorCode       string `json:"errorCode"`
+	FieldViolations []struct {
+		Field string `json:"field"`
+	} `json:"fieldViolations"`
 }
 
 // errorCode pulls FCM v1's machine-readable code out of an error response, preferring the
@@ -119,10 +181,8 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 func errorCode(body []byte) string {
 	var resp struct {
 		Error struct {
-			Status  string `json:"status"`
-			Details []struct {
-				ErrorCode string `json:"errorCode"`
-			} `json:"details"`
+			Status  string           `json:"status"`
+			Details []fcmErrorDetail `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -134,4 +194,26 @@ func errorCode(body []byte) string {
 		}
 	}
 	return resp.Error.Status
+}
+
+// tokenFieldViolation reports whether an FCM v1 error body names "message.token" in a
+// google.rpc.BadRequest field violation - the shape of a malformed/corrupt registration
+// token, as opposed to any other 400.
+func tokenFieldViolation(body []byte) bool {
+	var resp struct {
+		Error struct {
+			Details []fcmErrorDetail `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+	for _, d := range resp.Error.Details {
+		for _, v := range d.FieldViolations {
+			if v.Field == "message.token" {
+				return true
+			}
+		}
+	}
+	return false
 }

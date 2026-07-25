@@ -4,13 +4,14 @@
 // iOS devices, using token-based (.p8 key) authentication via github.com/sideshow/apns2,
 // the standard Go APNs client.
 //
-// Every notification it sends is a silent background push: aps carries only
-// content-available and mutable-content, never an alert, sound, or badge, so APNs itself -
-// and its logs - never see plaintext. The home server's already-encrypted payload and the
-// coarse kind travel as custom top-level fields; the device wakes in the background and
-// decrypts locally to decide how, or whether, to surface a notification. A real ringing
-// VoIP call would need PushKit and its own entitlement, which is out of scope for this
-// content-free relay.
+// Every notification it sends is content-free: aps carries only content-available and
+// mutable-content, never an alert, sound, or badge, so APNs itself - and its logs - never
+// see plaintext. The home server's already-encrypted payload and the coarse kind travel as
+// custom top-level fields; the device wakes and decrypts locally to decide how, or whether,
+// to surface a notification. push.KindCall is the one exception to "background wake": it
+// goes to the app's separate PushKit topic (the bundle id plus ".voip") as a
+// PushTypeVOIP/high-priority push, so a call rings promptly; every other kind stays a
+// low-priority PushTypeBackground wake on the plain bundle id topic.
 package apns
 
 import (
@@ -29,6 +30,12 @@ import (
 type client interface {
 	PushWithContext(ctx apns2.Context, n *apns2.Notification) (*apns2.Response, error)
 }
+
+// voipTopicSuffix is Apple's fixed convention for a VoIP-capable app's PushKit topic: the
+// bundle id with ".voip" appended. Deriving it from the one configured bundle id at send
+// time, rather than taking a second operator-supplied value, means the two topics can never
+// drift apart.
+const voipTopicSuffix = ".voip"
 
 // Sender holds the APNs token client and posts notifications to the gateway.
 type Sender struct {
@@ -95,6 +102,14 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 		// (10) unless the payload also triggers a user-visible alert, sound, or badge.
 		Priority: apns2.PriorityLow,
 		Payload:  p,
+	}
+	if m.Kind == push.KindCall {
+		// A call must ring the device promptly, so it takes PushKit's separate VoIP topic,
+		// push type, and high priority instead of the plain background wake every other kind
+		// uses.
+		n.Topic = s.bundleID + voipTopicSuffix
+		n.PushType = apns2.PushTypeVOIP
+		n.Priority = apns2.PriorityHigh
 	}
 	resp, err := s.client.PushWithContext(ctx, n)
 	if err != nil {

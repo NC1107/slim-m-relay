@@ -15,6 +15,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log"
+	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -25,6 +28,10 @@ const keyPrefix = "smr_"
 
 // ErrNotFound is returned for an unknown, or revoked, key.
 var ErrNotFound = errors.New("key not found")
+
+// ErrRegistrationCeiling is returned by Issue when minting another key would exceed the
+// configured maximum number of keys the relay will ever issue.
+var ErrRegistrationCeiling = errors.New("registration ceiling reached")
 
 // Key is one issued registration key. It never carries the plaintext or the hash. Label is
 // the public URL the registrant claimed, kept unverified purely to help an admin tell keys
@@ -40,7 +47,18 @@ type Key struct {
 // Store is the SQLite-backed key store.
 type Store struct {
 	db *sql.DB
+
+	// pruneMu guards lastPrune, the lazy-sweep gate for stale token bindings, the same way
+	// ratelimit.Limiter gates its own idle-bucket sweep: a background loop would be one more
+	// thing to start and stop cleanly, so pruning instead piggybacks on BindToken calls, at
+	// most once per pruneInterval.
+	pruneMu   sync.Mutex
+	lastPrune time.Time
 }
+
+// pruneInterval bounds how often BindToken's lazy sweep actually runs the DELETE, so a busy
+// relay isn't scanning the tokens table on every single call.
+const pruneInterval = time.Hour
 
 // Open opens (creating if needed) the key store at path and applies its schema.
 func Open(path string) (*Store, error) {
@@ -56,7 +74,7 @@ func Open(path string) (*Store, error) {
 	// "database is locked" without extra coordination, and lets BindToken's read-then-write
 	// stay race-free without needing SQLite-level locking of its own.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, lastPrune: time.Now()}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -78,28 +96,78 @@ CREATE TABLE IF NOT EXISTS keys (
 	revoked_at   INTEGER
 );
 CREATE TABLE IF NOT EXISTS tokens (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	platform   TEXT NOT NULL,
-	token      TEXT NOT NULL,
-	key_id     INTEGER NOT NULL REFERENCES keys(id),
-	created_at INTEGER NOT NULL,
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	platform     TEXT NOT NULL,
+	token        TEXT NOT NULL,
+	key_id       INTEGER NOT NULL REFERENCES keys(id),
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(platform, token)
 );`)
-	return err
+	if err != nil {
+		return err
+	}
+	// A store created before last_seen_at existed has the tokens table but not the column;
+	// add it defensively so opening an already-deployed database does not fail. SQLite has no
+	// "ADD COLUMN IF NOT EXISTS" - a duplicate-column error here just means a fresh store's
+	// CREATE TABLE above already included it.
+	_, alterErr := s.db.Exec(`ALTER TABLE tokens ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0`)
+	switch {
+	case alterErr == nil:
+		// The column was just added, so every existing row backfilled to 0 and would look
+		// older than any retention window. Pruning would then delete the whole table on the
+		// first sweep, destroying the token-to-key bindings that stop one key from pushing
+		// to another key's device. Treat rows that predate the column as seen now, which
+		// gives them a full retention window to be re-bound by real traffic.
+		if _, err := s.db.Exec(
+			`UPDATE tokens SET last_seen_at = ? WHERE last_seen_at = 0`, time.Now().Unix(),
+		); err != nil {
+			return err
+		}
+	case !strings.Contains(alterErr.Error(), "duplicate column name"):
+		return alterErr
+	}
+	return nil
 }
 
 // Issue mints a new key, stores only its hash, and returns the plaintext once. The
 // plaintext is unrecoverable afterward. label is an unverified admin hint (the claimed
-// public URL).
-func (s *Store) Issue(ctx context.Context, label string) (string, error) {
+// public URL). max bounds the total number of keys this store will ever issue - including
+// revoked ones, since revoking a key does not reopen the slot it used - so /v1/register
+// cannot grow the key table without bound; zero or negative disables the ceiling. Returns
+// ErrRegistrationCeiling once max is reached.
+//
+// The count-then-insert runs in one transaction, race-free for the same reason BindToken is
+// (see Open): the whole relay shares one connection, so a second Issue call blocks until
+// this one commits rather than reading a stale count.
+func (s *Store) Issue(ctx context.Context, label string, max int64) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	plain := keyPrefix + base64.RawURLEncoding.EncodeToString(raw)
-	if _, err := s.db.ExecContext(ctx,
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if max > 0 {
+		var count int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM keys`).Scan(&count); err != nil {
+			return "", err
+		}
+		if count >= max {
+			return "", ErrRegistrationCeiling
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO keys (key_hash, label, created_at) VALUES (?, ?, ?)`,
 		hashKey(plain), label, time.Now().Unix()); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return plain, nil
@@ -166,33 +234,76 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 // binding, or the original owner if the token was already claimed by someone else - so the
 // caller can compare the two and reject a mismatch without a second round trip.
 //
+// retention bounds how long a binding may go untouched by its owning key before it becomes
+// eligible for pruning (see maybePruneStaleTokens); zero or negative disables pruning. A
+// legitimate send from the owning key always refreshes the token's clock, so an actively
+// used token is never at risk regardless of how old the binding is.
+//
 // The read-then-write here is race-free because Open sets SetMaxOpenConns(1): the whole
 // relay shares one connection, so this transaction can never interleave with another.
-func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string) (int64, error) {
+func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, retention time.Duration) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	now := time.Now().Unix()
 	var owner int64
 	err = tx.QueryRowContext(ctx,
 		`SELECT key_id FROM tokens WHERE platform = ? AND token = ?`, platform, token).Scan(&owner)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO tokens (platform, token, key_id, created_at) VALUES (?, ?, ?, ?)`,
-			platform, token, keyID, time.Now().Unix()); err != nil {
+			`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
+			platform, token, keyID, now, now); err != nil {
 			return 0, err
 		}
 		owner = keyID
 	case err != nil:
 		return 0, err
+	default:
+		if owner == keyID {
+			// Only the owning key's own sends push the token's clock forward, so a different
+			// key merely naming a token it does not own - and being refused for it - can't keep
+			// an otherwise-abandoned binding alive forever.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE tokens SET last_seen_at = ? WHERE platform = ? AND token = ?`, now, platform, token); err != nil {
+				return 0, err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.maybePruneStaleTokens(ctx, retention)
 	return owner, nil
+}
+
+// maybePruneStaleTokens opportunistically deletes token bindings nobody has sent to within
+// retention, at most once per pruneInterval so a busy relay isn't scanning the tokens table
+// on every call. Unlike the keys table, which MaxRegistrations bounds directly, tokens grow
+// at a rate the caller controls with every send, and nothing on the happy path ever deletes
+// a row - so without this the table grows without bound. A dead device token is worthless
+// once the provider reports it unregistered and the caller stops sending to it, which is
+// exactly what lets it go quiet long enough to be pruned safely.
+func (s *Store) maybePruneStaleTokens(ctx context.Context, retention time.Duration) {
+	if retention <= 0 {
+		return
+	}
+	s.pruneMu.Lock()
+	due := time.Since(s.lastPrune) >= pruneInterval
+	if due {
+		s.lastPrune = time.Now()
+	}
+	s.pruneMu.Unlock()
+	if !due {
+		return
+	}
+	cutoff := time.Now().Add(-retention).Unix()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM tokens WHERE last_seen_at < ?`, cutoff); err != nil {
+		log.Printf("relay: prune stale tokens: %v", err)
+	}
 }
 
 func hashKey(plain string) string {

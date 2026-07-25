@@ -41,15 +41,20 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-// clientIP is the caller's address. The relay always runs behind a trusted reverse proxy
-// that sets X-Forwarded-For, so its first hop is the real client; a direct hit with no such
-// header falls back to the socket address.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+// clientIP is the caller's address used to key per-IP rate limiting. By default it is
+// always the TCP peer address: every proxy this relay documents (Caddy, Traefik, nginx)
+// appends its view of the peer to X-Forwarded-For, so the leftmost entry is whatever the
+// client itself put there - fully attacker-controlled - and trusting it lets one caller
+// spin up an unbounded number of distinct rate-limit buckets just by varying the header.
+// Only when the operator opts in with RELAY_TRUST_PROXY is the header read at all, and even
+// then it is the rightmost entry that is trusted, since that is the one hop a trusted
+// proxy itself appended and an external caller cannot forge.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			return strings.TrimSpace(parts[len(parts)-1])
 		}
-		return strings.TrimSpace(xff)
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
@@ -71,7 +76,7 @@ func recoverer(next http.Handler) http.Handler {
 }
 
 // tally counts delivery outcomes for logging, without touching tokens or payload content.
-func tally(results []push.Result) (delivered, unregistered, forbidden, failed int) {
+func tally(results []push.Result) (delivered, unregistered, forbidden, notAttempted, failed int) {
 	for _, r := range results {
 		switch r.Status {
 		case push.StatusDelivered:
@@ -80,6 +85,8 @@ func tally(results []push.Result) (delivered, unregistered, forbidden, failed in
 			unregistered++
 		case push.StatusForbidden:
 			forbidden++
+		case push.StatusNotAttempted:
+			notAttempted++
 		default:
 			failed++
 		}

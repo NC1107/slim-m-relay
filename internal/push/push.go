@@ -9,6 +9,7 @@ package push
 import (
 	"context"
 	"log"
+	"sync"
 )
 
 // Platform selects which provider a message is forwarded through.
@@ -56,6 +57,10 @@ const (
 	StatusForbidden Status = "forbidden"
 	// StatusError means the send failed for some other reason and may be worth a retry.
 	StatusError Status = "error"
+	// StatusNotAttempted means the request's per-request deadline was reached before this
+	// message's turn in the worker pool; the provider was never contacted. The caller should
+	// retry only these, not the whole batch, since everything else already has a real outcome.
+	StatusNotAttempted Status = "not_attempted"
 )
 
 // Result pairs an input token with its delivery outcome.
@@ -71,20 +76,50 @@ type Sender interface {
 }
 
 // Unconfigured returns a Sender that rejects every message with StatusError, logging why
-// exactly once per call. main wires this in for whichever platform is missing its
-// credentials, so the relay can start and serve every other endpoint - registration,
-// sending on the other platform, admin, health - without secrets it was never given.
+// at most once per request (see WithRequestScope). main wires this in for whichever
+// platform is missing its credentials, so the relay can start and serve every other
+// endpoint - registration, sending on the other platform, admin, health - without secrets
+// it was never given.
 func Unconfigured(platform string) Sender { return unconfigured{platform: platform} }
 
 type unconfigured struct{ platform string }
 
-func (u unconfigured) Send(_ context.Context, msgs []Message) []Result {
+// requestScopeKey is the context key WithRequestScope stores its dedupe map under.
+type requestScopeKey struct{}
+
+// WithRequestScope returns a context that lets every Unconfigured.Send call made while
+// handling one /v1/send request share a single dedupe map, so a stub sender logs its
+// rejection at most once per request no matter how many messages it is asked to reject.
+// dispatch calls Send once per message rather than once per batch, so without this a large
+// batch against an unconfigured provider - a supported configuration, since a relay started
+// without one platform's credentials is explicitly non-fatal - writes one log line per
+// token: attacker-driven disk amplification against an otherwise ordinary deployment.
+func WithRequestScope(ctx context.Context) context.Context {
+	return context.WithValue(ctx, requestScopeKey{}, &sync.Map{})
+}
+
+func (u unconfigured) Send(ctx context.Context, msgs []Message) []Result {
 	if len(msgs) > 0 {
-		log.Printf("relay: %s not configured; rejecting %d message(s)", u.platform, len(msgs))
+		u.logRejection(ctx)
 	}
 	out := make([]Result, len(msgs))
 	for i, m := range msgs {
 		out[i] = Result{Token: m.Token, Status: StatusError}
 	}
 	return out
+}
+
+// logRejection logs that this platform is unconfigured at most once per request scope (see
+// WithRequestScope), keyed by platform so an iOS and an Android rejection in the same
+// request each still get their own line. A call made outside any request scope - direct use
+// in a test, say - logs every time, matching the old unconditional behaviour.
+func (u unconfigured) logRejection(ctx context.Context) {
+	scope, ok := ctx.Value(requestScopeKey{}).(*sync.Map)
+	if !ok {
+		log.Printf("relay: %s not configured; rejecting message(s)", u.platform)
+		return
+	}
+	if _, alreadyLogged := scope.LoadOrStore(u.platform, struct{}{}); !alreadyLogged {
+		log.Printf("relay: %s not configured; rejecting message(s) for this request", u.platform)
+	}
 }

@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/nc1107/slim-m-relay/internal/keys"
 	"github.com/nc1107/slim-m-relay/internal/push"
@@ -34,11 +36,13 @@ type sendResp struct {
 // notification payload ceiling, the tighter of the two providers' limits.
 const maxPayloadBytes = 4096
 
-// pending tracks where in the response a platform-specific send's result belongs, so
-// results can be assembled per-provider and then scattered back into the caller's original
-// order.
-type pending struct {
+// dispatchItem is one message ready to send, paired with the platform sender it must go
+// through and the slot in results it belongs in, so a single bounded worker pool can drain
+// both platforms' pending messages together and still scatter each outcome back into the
+// caller's original order.
+type dispatchItem struct {
 	resultIdx int
+	sender    push.Sender
 	msg       push.Message
 }
 
@@ -48,6 +52,12 @@ type pending struct {
 // as dead. Every device token is bound to whichever key first sends to it (see
 // internal/keys); a send for someone else's token is rejected rather than forwarded. The
 // relay never logs tokens or payload content - only counts and the key id.
+//
+// Because each provider does one HTTP round trip per token, dispatch runs the batch through
+// a bounded worker pool under a hard per-request deadline (both from config), so a large
+// batch can neither serialize into a multi-minute request nor hang it indefinitely; whatever
+// has not been attempted by the deadline comes back as push.StatusNotAttempted so the caller
+// retries only those.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	plain := bearerToken(r)
 	if plain == "" {
@@ -80,7 +90,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := make([]push.Result, 0, len(req.Messages))
-	var iosPending, androidPending []pending
+	var items []dispatchItem
 
 	for _, m := range req.Messages {
 		if m.Token == "" {
@@ -100,7 +110,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
-		owner, err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token)
+		if kind == push.KindCall && !s.callLim.Allow(strconv.FormatInt(k.ID, 10)) {
+			// A call rings a device, making it the most abusable kind, so it has its own,
+			// tighter per-key budget under the general send rate limit checked above.
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			continue
+		}
+		retention := time.Duration(s.cfg.TokenRetentionDays) * 24 * time.Hour
+		owner, err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token, retention)
 		if err != nil {
 			log.Printf("relay: bind token: %v", err)
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
@@ -112,41 +129,119 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		sender := s.android
+		if platform == push.PlatformIOS {
+			sender = s.ios
+		}
 		idx := len(results)
 		results = append(results, push.Result{}) // filled in by dispatch below
-		item := pending{resultIdx: idx, msg: push.Message{Token: m.Token, Kind: kind, Payload: m.Payload}}
-		switch platform {
-		case push.PlatformIOS:
-			iosPending = append(iosPending, item)
-		case push.PlatformAndroid:
-			androidPending = append(androidPending, item)
-		}
+		items = append(items, dispatchItem{
+			resultIdx: idx,
+			sender:    sender,
+			msg:       push.Message{Token: m.Token, Kind: kind, Payload: m.Payload},
+		})
 	}
 
-	dispatch(r.Context(), s.ios, iosPending, results)
-	dispatch(r.Context(), s.android, androidPending, results)
+	s.dispatch(r.Context(), items, results)
+	// A call-kind message that never got attempted before the deadline must not have
+	// permanently spent its slice of the tighter per-key call budget: the caller is told to
+	// retry a not_attempted message, and that retry must not be silently refused because an
+	// attempt that never happened already paid for it.
+	s.refundNotAttemptedCalls(k.ID, items, results)
 
-	delivered, unregistered, forbidden, failed := tally(results)
-	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d error=%d",
-		k.ID, len(results), delivered, unregistered, forbidden, failed)
+	delivered, unregistered, forbidden, notAttempted, failed := tally(results)
+	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d not_attempted=%d error=%d",
+		k.ID, len(results), delivered, unregistered, forbidden, notAttempted, failed)
 	writeJSON(w, http.StatusOK, sendResp{Results: results})
 }
 
-// dispatch sends every pending message for one platform through sender and scatters each
-// push.Result back into its original slot in results. A no-op when items is empty, so a
-// batch with only one platform never touches the other provider.
-func dispatch(ctx context.Context, sender push.Sender, items []pending, results []push.Result) {
+// dispatch drains items through a bounded worker pool (concurrency from config) under a
+// hard per-request deadline (also from config), and scatters each outcome back into its
+// original slot in results. Bounding concurrency caps how many provider round trips are ever
+// in flight at once; the deadline bounds the total wall time regardless of batch size. A
+// message whose turn has not come when the deadline fires is left as push.StatusNotAttempted
+// rather than as a zero value, so the caller can tell "never tried" apart from every real
+// outcome and retry only those.
+//
+// Once the deadline fires, the feed loop below stops handing out new work, but a worker
+// already partway through an item's Send call is always let finish and report its real
+// outcome rather than being raced against the same deadline and abandoned - a message whose
+// turn already came deserves a real answer, not a coin-flip between that and not_attempted.
+// This is safe specifically because every Sender this dispatches to must itself honour ctx:
+// APNs' client and FCM's HTTP send already do via http.NewRequestWithContext, and FCM's
+// oauth2 token fetch - the one call in this codebase that used to be uncancellable, since
+// oauth2.TokenSource.Token() takes no context of its own - is now bounded by ctx too (see
+// fcm.Sender.token). So "already started" only ever means "already respecting ctx.Done()",
+// and finishing it takes microseconds past the deadline, not indefinitely.
+func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []push.Result) {
 	if len(items) == 0 {
 		return
 	}
-	msgs := make([]push.Message, len(items))
-	for i, p := range items {
-		msgs[i] = p.msg
+	if s.cfg.SendTimeoutSeconds > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.SendTimeoutSeconds)*time.Second)
+		defer cancel()
 	}
-	out := sender.Send(ctx, msgs)
-	for i, p := range items {
-		if i < len(out) {
-			results[p.resultIdx] = out[i]
+	// Lets every push.Unconfigured.Send call below share one dedupe map, so a stub sender
+	// logs its rejection at most once for this request regardless of how many messages it is
+	// asked to reject one at a time.
+	ctx = push.WithRequestScope(ctx)
+
+	workers := s.cfg.SendConcurrency
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(items) {
+		workers = len(items)
+	}
+
+	work := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range work {
+				item := items[idx]
+				out := item.sender.Send(ctx, []push.Message{item.msg})
+				status := push.StatusError
+				if len(out) > 0 {
+					status = out[0].Status
+				}
+				results[item.resultIdx] = push.Result{Token: item.msg.Token, Status: status}
+			}
+		}()
+	}
+
+feed:
+	for idx := range items {
+		select {
+		case work <- idx:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(work)
+	wg.Wait()
+
+	// Anything the pool never got to before the deadline is still its zero value; mark it
+	// not-attempted rather than leaving an empty status in the response.
+	for _, item := range items {
+		if results[item.resultIdx].Status == "" {
+			results[item.resultIdx] = push.Result{Token: item.msg.Token, Status: push.StatusNotAttempted}
+		}
+	}
+}
+
+// refundNotAttemptedCalls returns the tighter per-key call budget's token for every
+// call-kind message dispatch never actually attempted before the deadline. That budget is
+// spent in the parse loop above, before dispatch runs, so a call the deadline later cuts off
+// has already paid for an attempt that never happened; without the refund, retrying that
+// same not_attempted message can be wrongly refused by a budget that still reads as spent.
+func (s *Server) refundNotAttemptedCalls(keyID int64, items []dispatchItem, results []push.Result) {
+	for _, item := range items {
+		if item.msg.Kind == push.KindCall && results[item.resultIdx].Status == push.StatusNotAttempted {
+			s.callLim.Return(strconv.FormatInt(keyID, 10))
 		}
 	}
 }

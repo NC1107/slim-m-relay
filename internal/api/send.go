@@ -299,7 +299,8 @@ func parsePlatform(s string) (push.Platform, bool) {
 
 func parseKind(s string) (push.Kind, bool) {
 	switch push.Kind(s) {
-	case push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake:
+	case push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake,
+		push.KindVoice, push.KindAdminAlert:
 		return push.Kind(s), true
 	default:
 		return "", false

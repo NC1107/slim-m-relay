@@ -208,6 +208,30 @@ func TestSendSecurityKindUsesAlertPush(t *testing.T) {
 	}
 }
 
+// A voice notice and an admin alert each surface with their own fixed, content-free line.
+func TestSendVoiceAndAdminAlertKindsHaveTheirOwnText(t *testing.T) {
+	for kind, want := range map[push.Kind]string{
+		push.KindVoice:      "Voice channel activity",
+		push.KindAdminAlert: "Server alert",
+	} {
+		fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+		s := &Sender{client: fc, bundleID: "com.example.app"}
+		s.Send(context.Background(), []push.Message{{Token: "tok", Kind: kind, Payload: "cipher"}})
+
+		n := fc.got[0]
+		if n.PushType != apns2.PushTypeAlert {
+			t.Fatalf("%s push type = %q, want an alert", kind, n.PushType)
+		}
+		body, err := json.Marshal(n.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), want) {
+			t.Errorf("%s payload should carry %q: %s", kind, want, body)
+		}
+	}
+}
+
 // A call_end stops a ring, so it is a silent background push on the plain topic, never a VoIP one:
 // iOS kills an app that takes a VoIP push without reporting a new call.
 func TestSendCallEndKindIsSilentAndNotVoip(t *testing.T) {
@@ -223,7 +247,7 @@ func TestSendCallEndKindIsSilentAndNotVoip(t *testing.T) {
 
 // Only call signals expire with the ring; anything else keeps APNs' default store-and-forward.
 func TestSendExpiresOnlyCallSignals(t *testing.T) {
-	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake} {
+	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake, push.KindVoice, push.KindAdminAlert} {
 		t.Run(string(kind), func(t *testing.T) {
 			fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
 			s := &Sender{client: fc, bundleID: "com.example.app"}

@@ -45,9 +45,11 @@ const voipTopicSuffix = ".voip"
 // and message: it names nothing, so it is still content-free. A kind absent from this map
 // stays a silent background wake, which is what "wake" is for.
 var genericAlert = map[push.Kind]string{
-	push.KindMessage:  "New message",
-	push.KindMention:  "You were mentioned",
-	push.KindSecurity: "New sign-in to your account",
+	push.KindMessage:    "New message",
+	push.KindMention:    "You were mentioned",
+	push.KindSecurity:   "New sign-in to your account",
+	push.KindVoice:      "Voice channel activity",
+	push.KindAdminAlert: "Server alert",
 }
 
 // Sender holds the APNs token client and posts notifications to the gateway.

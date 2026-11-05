@@ -284,7 +284,7 @@ func TestSendNeverLogsContent(t *testing.T) {
 
 // A call signal carries a TTL matching the ring timeout, and nothing else does.
 func TestSendSetsTTLOnlyForCallSignals(t *testing.T) {
-	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake} {
+	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake, push.KindVoice, push.KindAdminAlert} {
 		t.Run(string(kind), func(t *testing.T) {
 			var got struct {
 				Message struct {

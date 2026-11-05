@@ -37,6 +37,10 @@ const (
 	KindCallEnd Kind = "call_end"
 	// KindSecurity is an account security alert, such as a sign-in from a new device.
 	KindSecurity Kind = "security"
+	// KindVoice says a voice channel call started, grew or went live.
+	KindVoice Kind = "voice"
+	// KindAdminAlert is a server health alert for the people who run the server.
+	KindAdminAlert Kind = "admin_alert"
 )
 
 // CallSignalTTL bounds how long a provider may hold a call or call_end push for an

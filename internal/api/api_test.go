@@ -367,6 +367,28 @@ func TestSendRejectsUnknownPlatformAndKind(t *testing.T) {
 	}
 }
 
+// A voice notice and an admin alert reach Android under their own kinds, so it can show its own line for each.
+func TestSendAcceptsVoiceAndAdminAlertKinds(t *testing.T) {
+	srv, _, android, store := newTestServer(t, defaultCfg())
+	key, _ := store.Issue(context.Background(), "", 0)
+
+	body := `{"messages":[
+		{"platform":"android","token":"a","kind":"voice","payload":"c"},
+		{"platform":"android","token":"b","kind":"admin_alert","payload":"c"}
+	]}`
+	rr := do(srv.Router(), http.MethodPost, "/v1/send", body, key)
+	var resp sendResp
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	for _, r := range resp.Results {
+		if r.Status != push.StatusDelivered {
+			t.Errorf("result %+v, want delivered", r)
+		}
+	}
+	if len(android.got) != 2 || android.got[0].Kind != push.KindVoice || android.got[1].Kind != push.KindAdminAlert {
+		t.Errorf("android got %+v, want the voice and admin_alert kinds forwarded", android.got)
+	}
+}
+
 func TestTwoServersDeliverToOneTokenAndAThirdIsRefused(t *testing.T) {
 	srv, ios, _, store := newTestServer(t, defaultCfg())
 	h := srv.Router()

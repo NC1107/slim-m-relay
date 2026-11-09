@@ -10,14 +10,21 @@ import (
 
 func ipFor(t *testing.T, trust bool, hops int, remote, xff string) string {
 	t.Helper()
+	return ipForHeaders(t, trust, hops, remote, xff)
+}
+
+func ipForHeaders(t *testing.T, trust bool, hops int, remote string, xff ...string) string {
+	t.Helper()
 	cfg := defaultCfg()
 	cfg.TrustProxy = trust
 	cfg.TrustProxyHops = hops
 	srv, _, _, _ := newTestServer(t, cfg)
 	req := httptest.NewRequest(http.MethodPost, "/v1/register", nil)
 	req.RemoteAddr = remote
-	if xff != "" {
-		req.Header.Set("X-Forwarded-For", xff)
+	for _, line := range xff {
+		if line != "" {
+			req.Header.Add("X-Forwarded-For", line)
+		}
 	}
 	return srv.clientIP(req)
 }
@@ -67,5 +74,15 @@ func TestClientIPTrustProxyHopsPicksTheNthFromTheRight(t *testing.T) {
 func TestClientIPFallsBackToThePeerWhenTheHeaderIsShorterThanTheHops(t *testing.T) {
 	if got := ipFor(t, true, 3, "203.0.113.9:1", "198.51.100.7"); got != "203.0.113.9" {
 		t.Errorf("short header = %q, want the peer", got)
+	}
+}
+
+func TestClientIPReadsEveryXForwardedForLineNotJustTheFirst(t *testing.T) {
+	// A proxy that appends its own line leaves the client's own line first.
+	if got := ipForHeaders(t, true, 1, "203.0.113.9:1", "6.6.6.6", "198.51.100.7"); got != "198.51.100.7" {
+		t.Errorf("two header lines = %q, want the proxy-appended rightmost entry, not the client's", got)
+	}
+	if got := ipForHeaders(t, true, 2, "203.0.113.9:1", "6.6.6.6", "198.51.100.7"); got != "6.6.6.6" {
+		t.Errorf("hops=2 across two lines = %q, want the entry before the proxy's", got)
 	}
 }

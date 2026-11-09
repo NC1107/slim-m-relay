@@ -59,7 +59,9 @@ func bearerToken(r *http.Request) string {
 // Only when the operator opts in with RELAY_TRUST_PROXY is the header read at all, and then
 // it is the entry TrustProxyHops places from the right, since those are the hops trusted
 // proxies themselves appended and an external caller cannot forge. A header too short for
-// that, or an entry that is not an IP, falls back to the peer address.
+// that, or an entry that is not an IP, falls back to the peer address. A proxy that appends
+// its own X-Forwarded-For line instead of extending the first one is read as one list, in
+// header order, so the rightmost entry is still the one the proxy added.
 //
 // The result is normalised by limiterKey, so one IPv6 /64 is one bucket.
 func (s *Server) clientIP(r *http.Request) string {
@@ -68,7 +70,7 @@ func (s *Server) clientIP(r *http.Request) string {
 		peer = host
 	}
 	if s.cfg.TrustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
 			parts := strings.Split(xff, ",")
 			hops := s.cfg.TrustProxyHops
 			if hops < 1 {

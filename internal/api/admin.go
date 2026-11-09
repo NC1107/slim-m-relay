@@ -12,9 +12,8 @@ import (
 	"github.com/nc1107/slim-m-relay/internal/keys"
 )
 
-// adminFailuresPerMinute and adminFailureBurst bound how fast one client may guess the admin
-// token. Only a failed comparison spends from the caller's budget, so a correct token is never
-// refused and a flood of wrong guesses behind a shared proxy address cannot lock the operator out.
+// adminFailuresPerMinute and adminFailureBurst throttle failed admin attempts per client; the token's
+// 32-character floor is what stops guessing, and only a failure spends, so a correct token is never refused.
 const (
 	adminFailuresPerMinute = 10
 	adminFailureBurst      = 5

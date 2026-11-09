@@ -13,7 +13,8 @@ import (
 )
 
 // adminFailuresPerMinute and adminFailureBurst bound how fast one client may guess the admin
-// token: every admin request spends from the caller's budget and a correct one gives it back.
+// token. Only a failed comparison spends from the caller's budget, so a correct token is never
+// refused and a flood of wrong guesses behind a shared proxy address cannot lock the operator out.
 const (
 	adminFailuresPerMinute = 10
 	adminFailureBurst      = 5
@@ -24,15 +25,13 @@ const (
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	want := []byte(s.cfg.AdminToken)
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := s.clientIP(r)
-		if !s.adminLim.Allow(ip) {
-			writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
-			return
-		}
 		got := []byte(bearerToken(r))
 		if len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1 {
-			s.adminLim.Return(ip)
 			next(w, r)
+			return
+		}
+		if !s.adminLim.Allow(s.clientIP(r)) {
+			writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 		writeErr(w, http.StatusUnauthorized, "unauthorized")

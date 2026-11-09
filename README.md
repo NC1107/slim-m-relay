@@ -76,7 +76,7 @@ A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned,
 
 Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set to at least 32 characters; a shorter token leaves them disabled and the relay says so at startup.
 Generate one with `openssl rand -hex 32`.
-Each client address may make a handful of failed admin attempts per minute before it gets `429`; a request with the right token does not count against that.
+Each client address may make a handful of failed admin attempts per minute before it gets `429`; a request with the right token is never throttled, even from an address that has used up its failed attempts.
 
 `platform` is `ios` or `android`.
 `kind` is `message`, `mention`, `call`, `call_end`, `security`, `voice`, `admin_alert`, or `wake`.

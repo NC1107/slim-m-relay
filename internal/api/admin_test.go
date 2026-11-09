@@ -152,8 +152,11 @@ func TestAdminThrottlesGuessesPerClientAddress(t *testing.T) {
 	if denied == 0 {
 		t.Fatal("ten wrong guesses in a row were never throttled")
 	}
-	if got := doFrom(h, attacker, http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusTooManyRequests {
-		t.Errorf("the right token from a throttled address = %d, want 429", got)
+	if got := doFrom(h, attacker, http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusOK {
+		t.Errorf("the right token from a throttled address = %d, want 200", got)
+	}
+	if got := doFrom(h, attacker, http.MethodGet, "/admin/keys", "wrong"); got != http.StatusTooManyRequests {
+		t.Errorf("a wrong token from a throttled address = %d, want 429", got)
 	}
 	if got := doFrom(h, operator, http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusOK {
 		t.Errorf("the right token from another address = %d, want 200", got)

@@ -417,3 +417,26 @@ func TestBindTokenCapsNewBindingsPerKey(t *testing.T) {
 	bindOK(t, s, kb.ID, "ios", "t3", lim)
 	bindOK(t, s, ka.ID, "ios", "t4", BindLimits{})
 }
+
+func TestBindTokenRefusesARevokedKeyAndLeavesNoBinding(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	plain, _ := s.Issue(ctx, "", 0)
+	k, _ := s.Verify(ctx, plain)
+	lim := BindLimits{MaxKeysPerToken: 8}
+
+	bindOK(t, s, k.ID, "ios", "t1", lim)
+	if err := s.Revoke(ctx, k.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindToken(ctx, k.ID, "ios", "t2", lim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("bind after revoke = %v, want ErrNotFound", err)
+	}
+	if err := s.BindToken(ctx, k.ID, "ios", "t1", lim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rebind of a dropped token after revoke = %v, want ErrNotFound", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE key_id = ?`, k.ID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("bindings for the revoked key = %d (%v), want 0", n, err)
+	}
+}

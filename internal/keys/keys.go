@@ -317,7 +317,10 @@ type BindLimits struct {
 // real servers out unless it keeps every one of its keys actively sending.
 //
 // It returns nil when keyID may deliver to the token. ErrTokenKeyLimit means the token is
-// full, ErrTokenLimit that keyID holds too many tokens.
+// full, ErrTokenLimit that keyID holds too many tokens, ErrNotFound that keyID was revoked.
+//
+// A new binding is only ever written for a live key. Revoke deletes the key's bindings once,
+// so a send that was already in flight would otherwise re-create them for a revoked key.
 //
 // A legitimate send from a key always refreshes its own binding's clock, so an actively used
 // token is never at risk of pruning.
@@ -350,6 +353,14 @@ func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token stri
 }
 
 func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, platform, token string, now int64, lim BindLimits) error {
+	var live int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM keys WHERE id = ? AND revoked_at IS NULL`, keyID).Scan(&live)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
 	if lim.MaxPerKey > 0 {
 		var bound int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&bound); err != nil {
@@ -381,7 +392,7 @@ func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, platform, token
 			}
 		}
 	}
-	_, err := tx.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
 		platform, token, keyID, now, now)
 	return err

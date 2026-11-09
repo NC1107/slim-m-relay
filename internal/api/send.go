@@ -131,6 +131,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 		err := s.keys.BindToken(r.Context(), k.ID, string(platform), token, s.bindLimits())
 		switch {
+		case errors.Is(err, keys.ErrNotFound):
+			// Revoked after Verify; nothing has been dispatched yet, so refuse the whole batch.
+			writeErr(w, http.StatusUnauthorized, "invalid or revoked key")
+			return
 		case errors.Is(err, keys.ErrTokenKeyLimit):
 			// Too many other servers already hold this token; refused like a stranger's.
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusForbidden})

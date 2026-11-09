@@ -3,9 +3,12 @@
 package keys
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -416,4 +419,114 @@ func TestBindTokenCapsNewBindingsPerKey(t *testing.T) {
 	bindOK(t, s, ka.ID, "ios", "t1", lim)
 	bindOK(t, s, kb.ID, "ios", "t3", lim)
 	bindOK(t, s, ka.ID, "ios", "t4", BindLimits{})
+}
+
+func TestBindTokenRefusesARevokedKeyAndLeavesNoBinding(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	plain, _ := s.Issue(ctx, "", 0)
+	k, _ := s.Verify(ctx, plain)
+	lim := BindLimits{MaxKeysPerToken: 8}
+
+	bindOK(t, s, k.ID, "ios", "t1", lim)
+	if err := s.Revoke(ctx, k.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindToken(ctx, k.ID, "ios", "t2", lim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("bind after revoke = %v, want ErrNotFound", err)
+	}
+	if err := s.BindToken(ctx, k.ID, "ios", "t1", lim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rebind of a dropped token after revoke = %v, want ErrNotFound", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE key_id = ?`, k.ID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("bindings for the revoked key = %d (%v), want 0", n, err)
+	}
+}
+
+func TestPurgeUnusedRemovesOnlyOldKeysThatNeverSentAndReopensTheirSlots(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	const max = 4
+	oldUnused, _ := s.Issue(ctx, "squatter", max)
+	newUnused, _ := s.Issue(ctx, "fresh", max)
+	oldUsed, _ := s.Issue(ctx, "active", max)
+	oldRevoked, _ := s.Issue(ctx, "revoked", max)
+	if _, err := s.Issue(ctx, "over", max); !errors.Is(err, ErrRegistrationCeiling) {
+		t.Fatalf("setup: ceiling not reached: %v", err)
+	}
+	used, _ := s.Verify(ctx, oldUsed)
+	revoked, _ := s.Verify(ctx, oldRevoked)
+	if err := s.Revoke(ctx, revoked.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE keys SET last_used_at = NULL WHERE id = ?`, revoked.ID); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE keys SET created_at = ? WHERE label != 'fresh'`, old); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PurgeUnused(ctx, 24*time.Hour)
+	if err != nil || n != 2 {
+		t.Fatalf("purged %d (%v), want the squatter and the revoked never-used key", n, err)
+	}
+	if _, err := s.Verify(ctx, oldUnused); !errors.Is(err, ErrNotFound) {
+		t.Errorf("purged key still verifies: %v", err)
+	}
+	for name, plain := range map[string]string{"fresh": newUnused, "active": oldUsed} {
+		if _, err := s.Verify(ctx, plain); err != nil {
+			t.Errorf("%s key was purged: %v", name, err)
+		}
+	}
+	bindOK(t, s, used.ID, "ios", "t1", BindLimits{})
+	if _, err := s.Issue(ctx, "reopened", max); err != nil {
+		t.Errorf("a purge should reopen registration slots: %v", err)
+	}
+}
+
+func TestPurgeUnusedDropsTheBindingsOfThePurgedKeys(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	plain, _ := s.Issue(ctx, "", 0)
+	k, _ := s.Verify(ctx, plain)
+	if _, err := s.db.Exec(`UPDATE keys SET last_used_at = NULL, created_at = 1 WHERE id = ?`, k.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES ('ios', 't', ?, 1, 1)`, k.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PurgeUnused(ctx, time.Hour); err != nil || n != 1 {
+		t.Fatalf("purged %d (%v), want 1", n, err)
+	}
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("tokens left = %d (%v), want 0", rows, err)
+	}
+}
+
+func TestIssueWarnsWhenTheCeilingIsNearAndWhenItIsReached(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	s := openTemp(t)
+	ctx := context.Background()
+	const max = 10
+	for i := 1; i <= max; i++ {
+		buf.Reset()
+		if _, err := s.Issue(ctx, "", max); err != nil {
+			t.Fatal(err)
+		}
+		out := buf.String()
+		switch {
+		case i == 8 && !strings.Contains(out, "8 of 10 registrations used"):
+			t.Errorf("key 8 of 10 logged %q, want the 80%% warning", out)
+		case i == max && !strings.Contains(out, "ceiling reached"):
+			t.Errorf("key %d of %d logged %q, want the ceiling notice", i, max, out)
+		case i != 8 && i != max && out != "":
+			t.Errorf("key %d logged %q, want nothing", i, out)
+		}
+	}
 }

@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"time"
 
 	"github.com/sideshow/apns2"
@@ -110,7 +111,7 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 	p.Custom("payload", m.Payload)
 
 	n := &apns2.Notification{
-		DeviceToken: m.Token,
+		DeviceToken: url.PathEscape(m.Token),
 		Topic:       s.bundleID,
 		PushType:    apns2.PushTypeBackground,
 		// A content-available-only push must use low priority; APNs rejects high priority

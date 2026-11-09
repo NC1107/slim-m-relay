@@ -5,10 +5,15 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 )
+
+// MinAdminTokenChars is the shortest RELAY_ADMIN_TOKEN the admin endpoints will run with,
+// the same floor slim-m applies to its own listener secret.
+const MinAdminTokenChars = 32
 
 // Config holds all runtime configuration for the relay.
 type Config struct {
@@ -16,7 +21,8 @@ type Config struct {
 	Port int
 	// DBPath is the SQLite file that stores hashed keys and device-token bindings.
 	DBPath string
-	// AdminToken guards the /admin endpoints (list and revoke keys). Empty disables them.
+	// AdminToken guards the /admin endpoints (list and revoke keys). Empty, or shorter than
+	// MinAdminTokenChars, disables them.
 	AdminToken string
 
 	// FCMCredentialsFile points to the Firebase service-account JSON used to send Android
@@ -142,6 +148,44 @@ func Load() (Config, error) {
 		BindingIdleDays:    p.int("RELAY_BINDING_IDLE_DAYS", 14),
 	}
 	return cfg, p.err
+}
+
+type namedInt struct {
+	name  string
+	value int
+}
+
+// AdminEnabled reports whether the admin endpoints are mounted: a token is set and long
+// enough that guessing it over the network is not realistic.
+func (c Config) AdminEnabled() bool { return len(c.AdminToken) >= MinAdminTokenChars }
+
+// Validate rejects numbers that parse but break the relay, naming each variable. A zero
+// burst or rate leaves a limiter that admits one call and then denies that caller forever,
+// and a zero RELAY_MAX_MESSAGES refuses every non-empty send. The knobs documented as
+// "zero or negative disables" are deliberately not checked. The proxy hop count only matters
+// once the proxy header is trusted.
+func (c Config) Validate() error {
+	atLeastOne := []namedInt{
+		{"RELAY_REGISTER_PER_HOUR", c.RegisterPerHour},
+		{"RELAY_REGISTER_BURST", c.RegisterBurst},
+		{"RELAY_SEND_ADMIT_PER_MINUTE", c.SendAdmitPerMinute},
+		{"RELAY_SEND_ADMIT_BURST", c.SendAdmitBurst},
+		{"RELAY_SEND_PER_MINUTE", c.SendPerMinute},
+		{"RELAY_SEND_BURST", c.SendBurst},
+		{"RELAY_CALL_SEND_PER_MINUTE", c.CallSendPerMinute},
+		{"RELAY_CALL_SEND_BURST", c.CallSendBurst},
+		{"RELAY_MAX_MESSAGES", c.MaxMessages},
+	}
+	if c.TrustProxy {
+		atLeastOne = append(atLeastOne, namedInt{"RELAY_TRUST_PROXY_HOPS", c.TrustProxyHops})
+	}
+	var errs []error
+	for _, f := range atLeastOne {
+		if f.value < 1 {
+			errs = append(errs, fmt.Errorf("%s=%d must be at least 1", f.name, f.value))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func getenv(key, def string) string {

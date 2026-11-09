@@ -267,3 +267,15 @@ func TestSendExpiresOnlyCallSignals(t *testing.T) {
 		})
 	}
 }
+
+// The token is spliced into the request path, so characters with meaning there must not
+// reach it unescaped.
+func TestSendEscapesTheDeviceTokenForTheRequestPath(t *testing.T) {
+	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+	s := &Sender{client: fc, bundleID: "com.example.app"}
+	s.Send(context.Background(), []push.Message{{Token: "ab/cd#1?x", Kind: push.KindWake, Payload: "cipher"}})
+
+	if len(fc.got) != 1 || fc.got[0].DeviceToken != "ab%2Fcd%231%3Fx" {
+		t.Fatalf("device token on the wire = %+v, want it path-escaped", fc.got)
+	}
+}

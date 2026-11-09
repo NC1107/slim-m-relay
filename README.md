@@ -36,8 +36,11 @@ It does not log tokens or payload content, only counts and error codes.
 Keys are stored as SHA-256 hashes in a small SQLite file, so a leak of the database yields nothing usable.
 Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`, and sending is rate-limited per key, with a tighter limit specifically on `call` kind pushes since a call rings a device and is the most abusable kind.
 Rate limiting is per-instance and in-process: it lives in the relay's own memory, not a shared store, so running more than one replica multiplies the effective limits rather than sharing one budget across them.
+Each limiter tracks at most 200000 client addresses or keys; when all of those are in use, new ones share a single bucket until idle ones age out, so a flood of rotating addresses cannot grow the relay's memory without bound.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
 Revoking a key also drops its device-token bindings.
+Keys that registered but never sent anything can be cleared with `POST /admin/keys/purge-unused`, which frees their registration slots if someone squats the ceiling.
+It is deliberately manual: a slim-m server whose key is purged gets `401` from every send until it is given a new one, so choose an age that no real server is still waiting inside.
 
 ### Token-to-key binding
 
@@ -55,7 +58,9 @@ A hostile server must still be unable to take a token away from a real one or to
 - Bindings created before this change keep working: the tokens table is rebuilt on first start with the same rows, one per key.
 
 The home server reads the `forbidden` result, counts it, and shows the count in its admin push view, so a server that is silently shut out is visible.
-A token must be 1 to 1024 printable ASCII characters with no whitespace (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
+A token must be 1 to 1024 characters (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
+An iOS token may use only letters, digits, `-` and `_`, because it becomes part of the APNs request path, and it is lowercased before it is bound or sent so a case variant cannot be a second binding for the same device; the result still echoes the spelling the server sent.
+An Android token may use only letters, digits, `-`, `_`, `.` and `:`, the alphabet Firebase issues.
 A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
 
 ## API
@@ -67,8 +72,11 @@ A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned,
 | `GET` | `/healthz` | none | Liveness. |
 | `GET` | `/admin/keys` | `Authorization: Bearer <admin token>` | List issued keys (metadata only). |
 | `POST` | `/admin/keys/{id}/revoke` | `Authorization: Bearer <admin token>` | Revoke a key. |
+| `POST` | `/admin/keys/purge-unused?older_than_days=N` | `Authorization: Bearer <admin token>` | Delete keys that never sent anything and were issued more than `N` days ago (`N` is required and at least 1). Returns `{"purged": n}`. |
 
-Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set.
+Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set to at least 32 characters; a shorter token leaves them disabled and the relay says so at startup.
+Generate one with `openssl rand -hex 32`.
+Each client address may make a handful of failed admin attempts per minute before it gets `429`; a request with the right token is never throttled, even from an address that has used up its failed attempts.
 
 `platform` is `ios` or `android`.
 `kind` is `message`, `mention`, `call`, `call_end`, `security`, `voice`, `admin_alert`, or `wake`.
@@ -118,7 +126,7 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 |----------|---------|-------------|
 | `RELAY_PORT` | `8090` | TCP port the relay listens on. |
 | `RELAY_DB_PATH` | `/data/relay.db` | SQLite key store path. |
-| `RELAY_ADMIN_TOKEN` | *(empty)* | Guards `/admin`. Empty disables those endpoints. |
+| `RELAY_ADMIN_TOKEN` | *(empty)* | Guards `/admin`. Empty, or shorter than 32 characters, disables those endpoints. Generate one with `openssl rand -hex 32`. |
 | `RELAY_FCM_CREDENTIALS_FILE` | *(empty)* | Path to the Firebase service-account JSON. Empty disables Android sends. |
 | `RELAY_APNS_KEY_PATH` | *(empty)* | Path to the APNs `.p8` token key. |
 | `RELAY_APNS_KEY_ID` | *(empty)* | The `.p8` key's 10-character key id. |
@@ -129,7 +137,7 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_TRUST_PROXY_HOPS` | `1` | How many proxies are in front of the relay when `RELAY_TRUST_PROXY` is on: the client is the entry that many places from the right of `X-Forwarded-For`. |
 | `RELAY_REGISTER_PER_HOUR` | `5` | Per-IP registration rate. |
 | `RELAY_REGISTER_BURST` | `3` | Per-IP registration burst. |
-| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will ever mint, across every IP, forever (revoked keys still count against it). Zero or negative disables the ceiling. |
+| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will hold, across every IP (revoked keys still count against it). Only `POST /admin/keys/purge-unused` gives slots back. The relay logs when 80% is used and again at the ceiling. Zero or negative disables the ceiling. |
 | `RELAY_SEND_ADMIT_PER_MINUTE` | `600` | Per-IP admission rate on `/v1/send`, checked before the bearer key is looked up so unauthenticated garbage never reaches the key store. Sized well above any honest server's send rate. |
 | `RELAY_SEND_ADMIT_BURST` | `120` | Per-IP admission burst on `/v1/send`. |
 | `RELAY_SEND_PER_MINUTE` | `120` | Per-key send rate. |
@@ -143,6 +151,9 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_MAX_KEYS_PER_TOKEN` | `8` | How many keys may deliver to one device token. A key past it comes back as `forbidden`. `0` or negative disables the cap. |
 | `RELAY_BINDING_IDLE_DAYS` | `14` | How long a binding on a full token must be unused before a new key may replace it. `0` or negative never replaces. |
 | `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `error`; one the key already owns keeps working. `0` or negative disables the cap. |
+
+The relay refuses to start when a per-minute or per-hour rate, a burst, or `RELAY_MAX_MESSAGES` is below 1, or when `RELAY_TRUST_PROXY_HOPS` is below 1 with `RELAY_TRUST_PROXY` on, and the error names the variable.
+A zero rate or burst would otherwise let one caller through once and then refuse it forever.
 
 ## Development
 

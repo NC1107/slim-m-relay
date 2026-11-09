@@ -37,34 +37,17 @@ type sendResp struct {
 // notification payload ceiling, the tighter of the two providers' limits.
 const maxPayloadBytes = 4096
 
-// maxTokenBytes bounds a device token. slim-m's server already refuses to register a
-// token over 1024 characters, so no real client token is longer.
-const maxTokenBytes = 1024
-
-// validToken reports whether token has the shape of a real APNs or FCM token: bounded and
-// printable ASCII with no whitespace. The server only length-checks tokens, so this is
-// deliberately not stricter per platform than what it will register; it exists so a caller
-// cannot make the relay store arbitrary bytes.
-func validToken(token string) bool {
-	if token == "" || len(token) > maxTokenBytes {
-		return false
-	}
-	for i := 0; i < len(token); i++ {
-		if c := token[i]; c <= ' ' || c > '~' {
-			return false
-		}
-	}
-	return true
-}
-
 // dispatchItem is one message ready to send, paired with the platform sender it must go
 // through and the slot in results it belongs in, so a single bounded worker pool can drain
 // both platforms' pending messages together and still scatter each outcome back into the
 // caller's original order.
 type dispatchItem struct {
 	resultIdx int
-	sender    push.Sender
-	msg       push.Message
+	// token is the token exactly as the caller sent it, which is what its result must echo
+	// so the caller can prune by it; msg.Token is the canonical form that goes to the provider.
+	token  string
+	sender push.Sender
+	msg    push.Message
 }
 
 // handleSend forwards a batch of notifications to APNs or FCM, per message, on behalf of a
@@ -121,16 +104,17 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		if m.Token == "" {
 			continue
 		}
-		if !validToken(m.Token) {
+		platform, ok := parsePlatform(m.Platform)
+		if !ok {
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			continue
+		}
+		token, ok := canonicalToken(platform, m.Token)
+		if !ok {
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
 		if len(m.Payload) > maxPayloadBytes {
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
-			continue
-		}
-		platform, ok := parsePlatform(m.Platform)
-		if !ok {
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
@@ -145,8 +129,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
-		err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token, s.bindLimits())
+		err := s.keys.BindToken(r.Context(), k.ID, string(platform), token, s.bindLimits())
 		switch {
+		case errors.Is(err, keys.ErrNotFound):
+			// Revoked after Verify; nothing has been dispatched yet, so refuse the whole batch.
+			writeErr(w, http.StatusUnauthorized, "invalid or revoked key")
+			return
 		case errors.Is(err, keys.ErrTokenKeyLimit):
 			// Too many other servers already hold this token; refused like a stranger's.
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusForbidden})
@@ -168,8 +156,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		results = append(results, push.Result{}) // filled in by dispatch below
 		items = append(items, dispatchItem{
 			resultIdx: idx,
+			token:     m.Token,
 			sender:    sender,
-			msg:       push.Message{Token: m.Token, Kind: kind, Payload: m.Payload},
+			msg:       push.Message{Token: token, Kind: kind, Payload: m.Payload},
 		})
 	}
 
@@ -250,7 +239,7 @@ func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []p
 				if len(out) > 0 {
 					status = out[0].Status
 				}
-				results[item.resultIdx] = push.Result{Token: item.msg.Token, Status: status}
+				results[item.resultIdx] = push.Result{Token: item.token, Status: status}
 			}
 		}()
 	}
@@ -270,7 +259,7 @@ feed:
 	// not-attempted rather than leaving an empty status in the response.
 	for _, item := range items {
 		if results[item.resultIdx].Status == "" {
-			results[item.resultIdx] = push.Result{Token: item.msg.Token, Status: push.StatusNotAttempted}
+			results[item.resultIdx] = push.Result{Token: item.token, Status: push.StatusNotAttempted}
 		}
 	}
 }

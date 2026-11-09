@@ -11,13 +11,26 @@ import (
 	"github.com/nc1107/slim-m-relay/internal/keys"
 )
 
+// adminFailuresPerMinute and adminFailureBurst bound how fast one client may guess the admin
+// token: every admin request spends from the caller's budget and a correct one gives it back.
+const (
+	adminFailuresPerMinute = 10
+	adminFailureBurst      = 5
+)
+
 // requireAdmin guards the admin handlers with a constant-time comparison against the
 // configured admin token, supplied as "Authorization: Bearer <token>".
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	want := []byte(s.cfg.AdminToken)
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := s.clientIP(r)
+		if !s.adminLim.Allow(ip) {
+			writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
 		got := []byte(bearerToken(r))
 		if len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1 {
+			s.adminLim.Return(ip)
 			next(w, r)
 			return
 		}

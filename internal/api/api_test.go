@@ -656,7 +656,7 @@ func TestSendPreservesResultOrderAcrossWorkers(t *testing.T) {
 
 func TestAdminRevokeStopsDelivery(t *testing.T) {
 	cfg := defaultCfg()
-	cfg.AdminToken = "admin-secret"
+	cfg.AdminToken = testAdminToken
 	srv, _, _, store := newTestServer(t, cfg)
 	key, _ := store.Issue(context.Background(), "", 0)
 	k, _ := store.Verify(context.Background(), key)
@@ -673,7 +673,7 @@ func TestAdminRevokeStopsDelivery(t *testing.T) {
 	}
 	// Revoke with the token.
 	revokePath := "/admin/keys/" + strconv.FormatInt(k.ID, 10) + "/revoke"
-	if rr := do(h, http.MethodPost, revokePath, "", "admin-secret"); rr.Code != http.StatusNoContent {
+	if rr := do(h, http.MethodPost, revokePath, "", testAdminToken); rr.Code != http.StatusNoContent {
 		t.Fatalf("revoke = %d, want 204", rr.Code)
 	}
 	// The key no longer sends.

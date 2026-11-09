@@ -39,6 +39,10 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+
 	androidSender := buildFCM(cfg)
 	iosSender := buildAPNs(cfg)
 
@@ -55,8 +59,12 @@ func main() {
 
 	srv := api.New(cfg, iosSender, androidSender, store)
 
-	if cfg.AdminToken == "" {
+	switch {
+	case cfg.AdminToken == "":
 		log.Println("relay: admin endpoints disabled (RELAY_ADMIN_TOKEN unset)")
+	case !cfg.AdminEnabled():
+		log.Printf("relay: admin endpoints disabled: RELAY_ADMIN_TOKEN is shorter than %d characters (try: openssl rand -hex 32)",
+			config.MinAdminTokenChars)
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Port)

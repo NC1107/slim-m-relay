@@ -31,6 +31,8 @@ type Server struct {
 	// a call rings a device, making it the most abusable kind - on top of sendLim's general
 	// per-key fan-out budget.
 	callLim *ratelimit.Limiter
+	// adminLim is IP-keyed and charged only for admin requests that fail authentication.
+	adminLim *ratelimit.Limiter
 }
 
 // New constructs a Server. ios and android are the platform senders /v1/send dispatches to
@@ -46,6 +48,7 @@ func New(cfg config.Config, ios, android push.Sender, store *keys.Store) *Server
 		sendAdmitLim: ratelimit.New(float64(cfg.SendAdmitPerMinute), cfg.SendAdmitBurst),
 		sendLim:      ratelimit.New(float64(cfg.SendPerMinute), cfg.SendBurst),
 		callLim:      ratelimit.New(float64(cfg.CallSendPerMinute), cfg.CallSendBurst),
+		adminLim:     ratelimit.New(adminFailuresPerMinute, adminFailureBurst),
 	}
 }
 
@@ -57,8 +60,8 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("POST /v1/register", s.handleRegister)
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 
-	// Admin is only mounted when a token is configured, and every request must carry it.
-	if s.cfg.AdminToken != "" {
+	// Admin is only mounted when a long enough token is configured, and every request must carry it.
+	if s.cfg.AdminEnabled() {
 		mux.HandleFunc("GET /admin/keys", s.requireAdmin(s.handleAdminListKeys))
 		mux.HandleFunc("POST /admin/keys/{id}/revoke", s.requireAdmin(s.handleAdminRevokeKey))
 	}

@@ -77,3 +77,98 @@ func TestLoadRejectsAMalformedValue(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAcceptsTheDefaults(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("defaults failed validation: %v", err)
+	}
+}
+
+func TestValidateRejectsNumbersThatBreakTheRelayNamingTheVariable(t *testing.T) {
+	cases := []struct{ name, value string }{
+		{"RELAY_MAX_MESSAGES", "0"},
+		{"RELAY_SEND_BURST", "0"},
+		{"RELAY_REGISTER_BURST", "0"},
+		{"RELAY_SEND_ADMIT_BURST", "-1"},
+		{"RELAY_CALL_SEND_BURST", "0"},
+		{"RELAY_REGISTER_PER_HOUR", "0"},
+		{"RELAY_SEND_ADMIT_PER_MINUTE", "0"},
+		{"RELAY_SEND_PER_MINUTE", "0"},
+		{"RELAY_CALL_SEND_PER_MINUTE", "0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.name, tc.value)
+			c, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.name+"="+tc.value) {
+				t.Fatalf("%s=%s: Validate = %v, want an error naming the variable and value", tc.name, tc.value, err)
+			}
+		})
+	}
+}
+
+func TestValidateReportsEveryProblemAtOnce(t *testing.T) {
+	t.Setenv("RELAY_MAX_MESSAGES", "0")
+	t.Setenv("RELAY_SEND_BURST", "0")
+	c, _ := Load()
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "RELAY_MAX_MESSAGES") || !strings.Contains(err.Error(), "RELAY_SEND_BURST") {
+		t.Fatalf("Validate = %v, want both variables named", err)
+	}
+}
+
+func TestValidateOnlyChecksTheProxyHopsOnceTheHeaderIsTrusted(t *testing.T) {
+	t.Setenv("RELAY_TRUST_PROXY_HOPS", "0")
+	c, _ := Load()
+	if err := c.Validate(); err != nil {
+		t.Errorf("hops=0 with the proxy header ignored = %v, want ok", err)
+	}
+	t.Setenv("RELAY_TRUST_PROXY", "true")
+	c, _ = Load()
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "RELAY_TRUST_PROXY_HOPS=0") {
+		t.Errorf("hops=0 with the proxy header trusted = %v, want an error naming it", err)
+	}
+	t.Setenv("RELAY_TRUST_PROXY_HOPS", "-3")
+	c, _ = Load()
+	if err := c.Validate(); err == nil {
+		t.Error("hops=-3 with the proxy header trusted validated, want an error")
+	}
+}
+
+func TestValidateLeavesTheDocumentedZeroDisablesKnobsAlone(t *testing.T) {
+	for _, name := range []string{
+		"RELAY_MAX_REGISTRATIONS", "RELAY_SEND_TIMEOUT_SECONDS", "RELAY_TOKEN_RETENTION_DAYS",
+		"RELAY_MAX_TOKENS_PER_KEY", "RELAY_MAX_KEYS_PER_TOKEN", "RELAY_BINDING_IDLE_DAYS",
+	} {
+		t.Setenv(name, "0")
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("zero-disables knobs failed validation: %v", err)
+	}
+}
+
+func TestAdminEnabledNeedsALongEnoughToken(t *testing.T) {
+	cases := map[string]bool{
+		"":       false,
+		"secret": false,
+		strings.Repeat("x", MinAdminTokenChars-1): false,
+		strings.Repeat("x", MinAdminTokenChars):   true,
+	}
+	for token, want := range cases {
+		if got := (Config{AdminToken: token}).AdminEnabled(); got != want {
+			t.Errorf("AdminEnabled with a %d char token = %v, want %v", len(token), got, want)
+		}
+	}
+}

@@ -70,7 +70,9 @@ A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned,
 | `GET` | `/admin/keys` | `Authorization: Bearer <admin token>` | List issued keys (metadata only). |
 | `POST` | `/admin/keys/{id}/revoke` | `Authorization: Bearer <admin token>` | Revoke a key. |
 
-Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set.
+Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set to at least 32 characters; a shorter token leaves them disabled and the relay says so at startup.
+Generate one with `openssl rand -hex 32`.
+Each client address may make a handful of failed admin attempts per minute before it gets `429`; a request with the right token does not count against that.
 
 `platform` is `ios` or `android`.
 `kind` is `message`, `mention`, `call`, `call_end`, `security`, `voice`, `admin_alert`, or `wake`.
@@ -120,7 +122,7 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 |----------|---------|-------------|
 | `RELAY_PORT` | `8090` | TCP port the relay listens on. |
 | `RELAY_DB_PATH` | `/data/relay.db` | SQLite key store path. |
-| `RELAY_ADMIN_TOKEN` | *(empty)* | Guards `/admin`. Empty disables those endpoints. |
+| `RELAY_ADMIN_TOKEN` | *(empty)* | Guards `/admin`. Empty, or shorter than 32 characters, disables those endpoints. Generate one with `openssl rand -hex 32`. |
 | `RELAY_FCM_CREDENTIALS_FILE` | *(empty)* | Path to the Firebase service-account JSON. Empty disables Android sends. |
 | `RELAY_APNS_KEY_PATH` | *(empty)* | Path to the APNs `.p8` token key. |
 | `RELAY_APNS_KEY_ID` | *(empty)* | The `.p8` key's 10-character key id. |
@@ -145,6 +147,9 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_MAX_KEYS_PER_TOKEN` | `8` | How many keys may deliver to one device token. A key past it comes back as `forbidden`. `0` or negative disables the cap. |
 | `RELAY_BINDING_IDLE_DAYS` | `14` | How long a binding on a full token must be unused before a new key may replace it. `0` or negative never replaces. |
 | `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `error`; one the key already owns keeps working. `0` or negative disables the cap. |
+
+The relay refuses to start when a per-minute or per-hour rate, a burst, or `RELAY_MAX_MESSAGES` is below 1, or when `RELAY_TRUST_PROXY_HOPS` is below 1 with `RELAY_TRUST_PROXY` on, and the error names the variable.
+A zero rate or burst would otherwise let one caller through once and then refuse it forever.
 
 ## Development
 

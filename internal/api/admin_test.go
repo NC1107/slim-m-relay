@@ -6,19 +6,24 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/nc1107/slim-m-relay/internal/config"
 )
+
+var testAdminToken = strings.Repeat("s", config.MinAdminTokenChars)
 
 func adminServer(t *testing.T) (http.Handler, func(method, path string) int) {
 	t.Helper()
 	cfg := defaultCfg()
-	cfg.AdminToken = "admin-secret"
+	cfg.AdminToken = testAdminToken
 	srv, _, _, _ := newTestServer(t, cfg)
 	h := srv.Router()
 	return h, func(method, path string) int {
-		return do(h, method, path, "", "admin-secret").Code
+		return do(h, method, path, "", testAdminToken).Code
 	}
 }
 
@@ -33,7 +38,7 @@ func TestAdminListRequiresTheToken(t *testing.T) {
 
 func TestAdminListIsAnEmptyArrayWhenThereAreNoKeys(t *testing.T) {
 	h, _ := adminServer(t)
-	rr := do(h, http.MethodGet, "/admin/keys", "", "admin-secret")
+	rr := do(h, http.MethodGet, "/admin/keys", "", testAdminToken)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("list = %d, want 200", rr.Code)
 	}
@@ -44,13 +49,13 @@ func TestAdminListIsAnEmptyArrayWhenThereAreNoKeys(t *testing.T) {
 
 func TestAdminListReturnsKeyMetadataOnly(t *testing.T) {
 	cfg := defaultCfg()
-	cfg.AdminToken = "admin-secret"
+	cfg.AdminToken = testAdminToken
 	srv, _, _, store := newTestServer(t, cfg)
 	secret, err := store.Issue(context.Background(), "https://slim.example", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rr := do(srv.Router(), http.MethodGet, "/admin/keys", "", "admin-secret")
+	rr := do(srv.Router(), http.MethodGet, "/admin/keys", "", testAdminToken)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("list = %d, want 200", rr.Code)
 	}
@@ -83,28 +88,82 @@ func TestAdminRevokeRejectsABadOrUnknownID(t *testing.T) {
 
 func TestAdminRevokeTwiceIsNotFound(t *testing.T) {
 	cfg := defaultCfg()
-	cfg.AdminToken = "admin-secret"
+	cfg.AdminToken = testAdminToken
 	srv, _, _, store := newTestServer(t, cfg)
 	secret, _ := store.Issue(context.Background(), "", 0)
 	k, _ := store.Verify(context.Background(), secret)
 	path := "/admin/keys/" + strconv.FormatInt(k.ID, 10) + "/revoke"
-	if rr := do(srv.Router(), http.MethodPost, path, "", "admin-secret"); rr.Code != http.StatusNoContent {
+	if rr := do(srv.Router(), http.MethodPost, path, "", testAdminToken); rr.Code != http.StatusNoContent {
 		t.Fatalf("first revoke = %d, want 204", rr.Code)
 	}
-	if rr := do(srv.Router(), http.MethodPost, path, "", "admin-secret"); rr.Code != http.StatusNotFound {
+	if rr := do(srv.Router(), http.MethodPost, path, "", testAdminToken); rr.Code != http.StatusNotFound {
 		t.Errorf("second revoke = %d, want 404", rr.Code)
 	}
 }
 
 func TestAdminHandlersReportStoreFailureAs500(t *testing.T) {
 	cfg := defaultCfg()
-	cfg.AdminToken = "admin-secret"
+	cfg.AdminToken = testAdminToken
 	srv, _, _, store := newTestServer(t, cfg)
 	_ = store.Close()
-	if rr := do(srv.Router(), http.MethodGet, "/admin/keys", "", "admin-secret"); rr.Code != http.StatusInternalServerError {
+	if rr := do(srv.Router(), http.MethodGet, "/admin/keys", "", testAdminToken); rr.Code != http.StatusInternalServerError {
 		t.Errorf("list on a closed store = %d, want 500", rr.Code)
 	}
-	if rr := do(srv.Router(), http.MethodPost, "/admin/keys/1/revoke", "", "admin-secret"); rr.Code != http.StatusInternalServerError {
+	if rr := do(srv.Router(), http.MethodPost, "/admin/keys/1/revoke", "", testAdminToken); rr.Code != http.StatusInternalServerError {
 		t.Errorf("revoke on a closed store = %d, want 500", rr.Code)
+	}
+}
+
+func TestAdminIsNotMountedForATokenShorterThanTheMinimum(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.AdminToken = strings.Repeat("s", config.MinAdminTokenChars-1)
+	srv, _, _, _ := newTestServer(t, cfg)
+	rr := do(srv.Router(), http.MethodGet, "/admin/keys", "", cfg.AdminToken)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("list with a %d char admin token = %d, want 404 (not mounted)", len(cfg.AdminToken), rr.Code)
+	}
+}
+
+func doFrom(h http.Handler, remote, method, target, bearer string) int {
+	req := httptest.NewRequest(method, target, nil)
+	req.RemoteAddr = remote
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr.Code
+}
+
+func TestAdminThrottlesGuessesPerClientAddress(t *testing.T) {
+	h, _ := adminServer(t)
+	const attacker, operator = "198.51.100.7:1", "203.0.113.9:1"
+	var denied int
+	for i := 0; i < adminFailureBurst+5; i++ {
+		switch got := doFrom(h, attacker, http.MethodGet, "/admin/keys", "wrong"); got {
+		case http.StatusUnauthorized:
+		case http.StatusTooManyRequests:
+			denied++
+		default:
+			t.Fatalf("guess %d = %d, want 401 or 429", i, got)
+		}
+	}
+	if denied == 0 {
+		t.Fatal("ten wrong guesses in a row were never throttled")
+	}
+	if got := doFrom(h, attacker, http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusTooManyRequests {
+		t.Errorf("the right token from a throttled address = %d, want 429", got)
+	}
+	if got := doFrom(h, operator, http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusOK {
+		t.Errorf("the right token from another address = %d, want 200", got)
+	}
+}
+
+func TestAdminSuccessfulCallsDoNotUseUpTheGuessBudget(t *testing.T) {
+	h, _ := adminServer(t)
+	for i := 0; i < adminFailureBurst*4; i++ {
+		if got := doFrom(h, "203.0.113.9:1", http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusOK {
+			t.Fatalf("call %d with the right token = %d, want 200", i, got)
+		}
 	}
 }

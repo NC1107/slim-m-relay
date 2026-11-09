@@ -6,36 +6,61 @@
 package ratelimit
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
 
-// Limiter refills each bucket at a fixed rate up to a burst ceiling.
+// Limiter refills each bucket at a fixed rate up to a burst ceiling. It tracks at most
+// maxBuckets keys: keys past that share one overflow bucket rather than growing the map, so
+// a flood of distinct client addresses cannot grow the relay's memory without bound.
 type Limiter struct {
-	mu        sync.Mutex
-	buckets   map[string]*bucket
-	rate      float64 // tokens per second
-	burst     float64
-	lastEvict time.Time
+	mu      sync.Mutex
+	buckets map[string]*list.Element // value is a *bucket
+	// order runs from the most to the least recently used bucket, so idle ones are always at
+	// the back and a sweep never has to walk the whole map.
+	order    *list.List
+	overflow *bucket
+	rate     float64 // tokens per second
+	burst    float64
+	// idleAfter is how long a bucket must sit unused to be full again, so dropping it and
+	// creating a fresh one behave the same.
+	idleAfter  time.Duration
+	maxBuckets int
 }
 
 type bucket struct {
+	key    string
 	tokens float64
 	last   time.Time
 }
 
-// evictInterval is how often idle buckets are swept. Driven by elapsed time rather than a
-// call counter so an idle relay still releases memory.
-const evictInterval = 5 * time.Minute
+// defaultMaxBuckets bounds the tracked keys per limiter; one bucket is a few hundred bytes.
+const defaultMaxBuckets = 200_000
+
+// sweepChunk bounds how many idle buckets one call drops, so the lock is never held for a
+// pass over the whole map; the sweep is amortised across calls instead.
+const sweepChunk = 128
+
+// minIdleBeforeEvict is the shortest idle time before a bucket is dropped, however fast it refills.
+const minIdleBeforeEvict = 10 * time.Minute
 
 // New builds a Limiter that refills perMinute tokens per minute, up to burst.
 func New(perMinute float64, burst int) *Limiter {
-	return &Limiter{
-		buckets:   make(map[string]*bucket),
-		rate:      perMinute / 60.0,
-		burst:     float64(burst),
-		lastEvict: time.Now(),
+	l := &Limiter{
+		buckets:    make(map[string]*list.Element),
+		order:      list.New(),
+		rate:       perMinute / 60.0,
+		burst:      float64(burst),
+		idleAfter:  minIdleBeforeEvict,
+		maxBuckets: defaultMaxBuckets,
 	}
+	if l.rate > 0 {
+		if refill := time.Duration(l.burst / l.rate * float64(time.Second)); refill > l.idleAfter {
+			l.idleAfter = refill
+		}
+	}
+	return l
 }
 
 // Allow reports whether an action for key may proceed, consuming one token if so.
@@ -43,13 +68,9 @@ func (l *Limiter) Allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	if now.Sub(l.lastEvict) > evictInterval {
-		l.evictIdle(now)
-		l.lastEvict = now
-	}
-	b, ok := l.buckets[key]
-	if !ok {
-		l.buckets[key] = &bucket{tokens: l.burst - 1, last: now}
+	l.evictIdle(now)
+	b, fresh := l.bucketFor(key, now)
+	if fresh {
 		return true
 	}
 	b.tokens += now.Sub(b.last).Seconds() * l.rate
@@ -64,6 +85,26 @@ func (l *Limiter) Allow(key string) bool {
 	return false
 }
 
+// bucketFor returns key's bucket, moved to the front of the usage order. A key seen for the
+// first time gets a bucket with its first token already spent and fresh set, so the caller
+// allows it without refilling. When the map is full of buckets that are all still in use, the
+// key falls back to the shared overflow bucket instead of adding an entry.
+func (l *Limiter) bucketFor(key string, now time.Time) (b *bucket, fresh bool) {
+	if el, ok := l.buckets[key]; ok {
+		l.order.MoveToFront(el)
+		return el.Value.(*bucket), false
+	}
+	if len(l.buckets) >= l.maxBuckets {
+		if l.overflow == nil {
+			l.overflow = &bucket{tokens: l.burst, last: now}
+		}
+		return l.overflow, false
+	}
+	b = &bucket{key: key, tokens: l.burst - 1, last: now}
+	l.buckets[key] = l.order.PushFront(b)
+	return b, true
+}
+
 // Return gives back one token to key's bucket, undoing a prior Allow that turned out not to
 // be needed - for example a message that consumed a tighter per-key budget (like the call
 // kind's) but was then never attempted before the request's deadline fired. It is a no-op
@@ -71,32 +112,31 @@ func (l *Limiter) Allow(key string) bool {
 func (l *Limiter) Return(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	b, ok := l.buckets[key]
+	el, ok := l.buckets[key]
 	if !ok {
 		return
 	}
+	b := el.Value.(*bucket)
 	b.tokens++
 	if b.tokens > l.burst {
 		b.tokens = l.burst
 	}
 }
 
-// minIdleBeforeEvict is the shortest idle time before a bucket is dropped, however fast it refills.
-const minIdleBeforeEvict = 10 * time.Minute
-
-// evictIdle drops buckets that have sat idle long enough to be full again, so a dropped
-// bucket and a fresh one behave the same. Must be called with l.mu held.
+// evictIdle drops up to sweepChunk buckets from the idle end of the usage order. Must be
+// called with l.mu held.
 func (l *Limiter) evictIdle(now time.Time) {
-	idle := minIdleBeforeEvict
-	if l.rate > 0 {
-		if refill := time.Duration(l.burst / l.rate * float64(time.Second)); refill > idle {
-			idle = refill
+	cutoff := now.Add(-l.idleAfter)
+	for i := 0; i < sweepChunk; i++ {
+		el := l.order.Back()
+		if el == nil {
+			return
 		}
-	}
-	cutoff := now.Add(-idle)
-	for k, b := range l.buckets {
-		if b.last.Before(cutoff) {
-			delete(l.buckets, k)
+		b := el.Value.(*bucket)
+		if !b.last.Before(cutoff) {
+			return
 		}
+		l.order.Remove(el)
+		delete(l.buckets, b.key)
 	}
 }

@@ -3,9 +3,25 @@
 package ratelimit
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
+
+// ageBucket makes key look last used d ago, keeping the usage order the sweep relies on.
+func ageBucket(l *Limiter, key string, d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	el := l.buckets[key]
+	el.Value.(*bucket).last = time.Now().Add(-d)
+	l.order.MoveToBack(el)
+}
+
+func bucketCount(l *Limiter) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.buckets)
+}
 
 func TestAllowsUpToBurstThenDenies(t *testing.T) {
 	// No refill worth mentioning within the test's runtime, so the burst is the whole budget.
@@ -42,18 +58,12 @@ func TestEvictsIdleBuckets(t *testing.T) {
 		t.Fatal("setup: both keys should be allowed on their first call")
 	}
 
-	l.mu.Lock()
-	if len(l.buckets) != 2 {
-		t.Fatalf("setup: want 2 buckets before eviction, got %d", len(l.buckets))
+	if got := bucketCount(l); got != 2 {
+		t.Fatalf("setup: want 2 buckets before eviction, got %d", got)
 	}
-	// Age both buckets past evictIdle's 10-minute cutoff, and force the next Allow to treat
-	// evictInterval as elapsed, so the sweep runs deterministically instead of waiting on
-	// real wall-clock time.
-	old := time.Now().Add(-11 * time.Minute)
-	l.buckets["stale-a"].last = old
-	l.buckets["stale-b"].last = old
-	l.lastEvict = time.Now().Add(-2 * evictInterval)
-	l.mu.Unlock()
+	// Age both buckets past the 10-minute idle cutoff so the next call sweeps them.
+	ageBucket(l, "stale-a", 11*time.Minute)
+	ageBucket(l, "stale-b", 11*time.Minute)
 
 	if !l.Allow("fresh") {
 		t.Fatal("a new key should be allowed regardless of the sweep")
@@ -100,13 +110,11 @@ func TestReturnDoesNotExceedBurst(t *testing.T) {
 		t.Fatal("first call for a key with no prior bucket should still be allowed")
 	}
 
-	l.mu.Lock()
-	l.buckets["k"] = &bucket{tokens: 1, last: time.Now()}
-	l.mu.Unlock()
+	l.Allow("k")
 	l.Return("k")
 	l.Return("k")
 	l.mu.Lock()
-	got := l.buckets["k"].tokens
+	got := l.buckets["k"].Value.(*bucket).tokens
 	l.mu.Unlock()
 	if got != 1 {
 		t.Errorf("tokens = %v after returning past a full bucket, want capped at burst (1)", got)
@@ -123,9 +131,7 @@ func TestRefillsOverTime(t *testing.T) {
 	if l.Allow("k") {
 		t.Fatal("second immediate call should be denied")
 	}
-	l.mu.Lock()
-	l.buckets["k"].last = l.buckets["k"].last.Add(-2 * time.Second)
-	l.mu.Unlock()
+	ageBucket(l, "k", 2*time.Second)
 	if !l.Allow("k") {
 		t.Fatal("after ~2s of refill the call should be allowed again")
 	}
@@ -143,13 +149,77 @@ func TestEvictionDoesNotResetASlowLimiter(t *testing.T) {
 		t.Fatal("4th immediate call should be denied")
 	}
 
-	l.mu.Lock()
-	l.buckets["ip"].last = time.Now().Add(-11 * time.Minute)
-	l.lastEvict = time.Now().Add(-2 * evictInterval)
-	l.mu.Unlock()
+	ageBucket(l, "ip", 11*time.Minute)
 
 	// 11 minutes at 5/hour is about 0.9 tokens, so still under one: must be denied.
 	if l.Allow("ip") {
 		t.Fatal("allowed after 11 idle minutes: eviction handed back a full burst, only ~0.9 token would have refilled")
+	}
+}
+
+func TestTheBucketCountNeverPassesTheCap(t *testing.T) {
+	l := New(0, 1)
+	l.maxBuckets = 5
+	for i := 0; i < 50; i++ {
+		l.Allow(fmt.Sprintf("ip-%d", i))
+	}
+	if got := bucketCount(l); got != 5 {
+		t.Fatalf("buckets = %d after 50 distinct keys, want the cap of 5", got)
+	}
+}
+
+// A flood of distinct addresses shares one bucket past the cap and never resets a tracked
+// key's spent budget to make room.
+func TestKeysPastTheCapShareOneOverflowBucketAndTrackedKeysAreUntouched(t *testing.T) {
+	l := New(0, 1)
+	l.maxBuckets = 2
+	if !l.Allow("a") || !l.Allow("b") {
+		t.Fatal("setup: the two tracked keys should each get their burst")
+	}
+	if !l.Allow("c") {
+		t.Fatal("the first key past the cap should draw the overflow bucket's burst")
+	}
+	if l.Allow("d") {
+		t.Error("a second new key past the cap should find the shared overflow bucket spent")
+	}
+	if l.Allow("a") {
+		t.Error("a tracked key's spent budget was reset to make room for a newcomer")
+	}
+}
+
+func TestTheCapIsRelievedOnceBucketsGoIdle(t *testing.T) {
+	l := New(0, 1)
+	l.maxBuckets = 2
+	l.Allow("a")
+	l.Allow("b")
+	ageBucket(l, "a", 11*time.Minute)
+	ageBucket(l, "b", 11*time.Minute)
+
+	if !l.Allow("c") || !l.Allow("d") {
+		t.Fatal("with room freed by the idle sweep, each new key should get its own bucket")
+	}
+	if l.Allow("c") {
+		t.Error("c should be tracked on its own after the sweep, not share an overflow bucket")
+	}
+}
+
+func TestOneCallSweepsAtMostAChunkSoTheLockIsNeverHeldForAFullPass(t *testing.T) {
+	l := New(60, 1)
+	const n = 1000
+	for i := 0; i < n; i++ {
+		l.Allow(fmt.Sprintf("ip-%d", i))
+	}
+	for i := 0; i < n; i++ {
+		ageBucket(l, fmt.Sprintf("ip-%d", i), 11*time.Minute)
+	}
+	l.Allow("trigger")
+	if got, want := bucketCount(l), n-sweepChunk+1; got != want {
+		t.Fatalf("buckets after one call = %d, want %d (one chunk swept, one added)", got, want)
+	}
+	for i := 0; i < n/sweepChunk+1; i++ {
+		l.Allow("trigger")
+	}
+	if got := bucketCount(l); got != 1 {
+		t.Errorf("buckets after repeated calls = %d, want only the live one", got)
 	}
 }

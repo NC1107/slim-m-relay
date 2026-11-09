@@ -36,6 +36,7 @@ It does not log tokens or payload content, only counts and error codes.
 Keys are stored as SHA-256 hashes in a small SQLite file, so a leak of the database yields nothing usable.
 Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`, and sending is rate-limited per key, with a tighter limit specifically on `call` kind pushes since a call rings a device and is the most abusable kind.
 Rate limiting is per-instance and in-process: it lives in the relay's own memory, not a shared store, so running more than one replica multiplies the effective limits rather than sharing one budget across them.
+Each limiter tracks at most 200000 client addresses or keys; when all of those are in use, new ones share a single bucket until idle ones age out, so a flood of rotating addresses cannot grow the relay's memory without bound.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
 Revoking a key also drops its device-token bindings.
 Keys that registered but never sent anything can be cleared with `POST /admin/keys/purge-unused`, which frees their registration slots if someone squats the ceiling.

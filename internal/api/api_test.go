@@ -507,8 +507,8 @@ func TestRefundNotAttemptedCallsReturnsTheToken(t *testing.T) {
 	items := []dispatchItem{
 		// Occupies the sole worker slot until the deadline cancels it, so the call below
 		// never gets a turn at all - a real not_attempted, not merely a slow one.
-		{resultIdx: 0, sender: sender, msg: push.Message{Token: "wake-1", Kind: push.KindWake, Payload: "c"}},
-		{resultIdx: 1, sender: sender, msg: push.Message{Token: "call-1", Kind: push.KindCall, Payload: "c"}},
+		{resultIdx: 0, token: "wake-1", sender: sender, msg: push.Message{Token: "wake-1", Kind: push.KindWake, Payload: "c"}},
+		{resultIdx: 1, token: "call-1", sender: sender, msg: push.Message{Token: "call-1", Kind: push.KindCall, Payload: "c"}},
 	}
 	results := make([]push.Result, len(items))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -594,9 +594,9 @@ func TestDispatchMarksUnattemptedAsNotAttempted(t *testing.T) {
 	srv := New(cfg, sender, sender, store)
 
 	items := []dispatchItem{
-		{resultIdx: 0, sender: sender, msg: push.Message{Token: "a", Kind: push.KindWake, Payload: "c"}},
-		{resultIdx: 1, sender: sender, msg: push.Message{Token: "b", Kind: push.KindWake, Payload: "c"}},
-		{resultIdx: 2, sender: sender, msg: push.Message{Token: "c", Kind: push.KindWake, Payload: "c"}},
+		{resultIdx: 0, token: "a", sender: sender, msg: push.Message{Token: "a", Kind: push.KindWake, Payload: "c"}},
+		{resultIdx: 1, token: "b", sender: sender, msg: push.Message{Token: "b", Kind: push.KindWake, Payload: "c"}},
+		{resultIdx: 2, token: "c", sender: sender, msg: push.Message{Token: "c", Kind: push.KindWake, Payload: "c"}},
 	}
 	results := make([]push.Result, len(items))
 
@@ -614,8 +614,8 @@ func TestDispatchMarksUnattemptedAsNotAttempted(t *testing.T) {
 		if results[i].Status != push.StatusNotAttempted {
 			t.Errorf("result[%d] = %+v, want not_attempted (never reached before the deadline)", i, results[i])
 		}
-		if results[i].Token != items[i].msg.Token {
-			t.Errorf("result[%d].Token = %q, want %q", i, results[i].Token, items[i].msg.Token)
+		if results[i].Token != items[i].token {
+			t.Errorf("result[%d].Token = %q, want %q", i, results[i].Token, items[i].token)
 		}
 	}
 }

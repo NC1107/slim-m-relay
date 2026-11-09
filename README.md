@@ -55,7 +55,9 @@ A hostile server must still be unable to take a token away from a real one or to
 - Bindings created before this change keep working: the tokens table is rebuilt on first start with the same rows, one per key.
 
 The home server reads the `forbidden` result, counts it, and shows the count in its admin push view, so a server that is silently shut out is visible.
-A token must be 1 to 1024 printable ASCII characters with no whitespace (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
+A token must be 1 to 1024 characters (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
+An iOS token may use only letters, digits, `-` and `_`, because it becomes part of the APNs request path, and it is lowercased before it is bound or sent so a case variant cannot be a second binding for the same device; the result still echoes the spelling the server sent.
+An Android token may use only letters, digits, `-`, `_`, `.` and `:`, the alphabet Firebase issues.
 A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
 
 ## API

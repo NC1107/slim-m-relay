@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/nc1107/slim-m-relay/internal/keys"
 )
@@ -69,4 +70,26 @@ func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxPurgeAgeDays keeps the age in days from overflowing a time.Duration.
+const maxPurgeAgeDays = 36500
+
+// handleAdminPurgeUnused deletes keys that never sent and are older than older_than_days,
+// freeing registration slots squatted by keys nobody uses. The age is required and at least
+// a day, so a call can never wipe keys a server has only just been given.
+func (s *Server) handleAdminPurgeUnused(w http.ResponseWriter, r *http.Request) {
+	days, err := strconv.Atoi(r.URL.Query().Get("older_than_days"))
+	if err != nil || days < 1 || days > maxPurgeAgeDays {
+		writeErr(w, http.StatusBadRequest, "older_than_days must be a whole number of days, 1 or more")
+		return
+	}
+	n, err := s.keys.PurgeUnused(r.Context(), time.Duration(days)*24*time.Hour)
+	if err != nil {
+		log.Printf("relay: purge unused keys: %v", err)
+		writeErr(w, http.StatusInternalServerError, "server error")
+		return
+	}
+	log.Printf("relay: purged %d keys never used and older than %d days", n, days)
+	writeJSON(w, http.StatusOK, map[string]int64{"purged": n})
 }

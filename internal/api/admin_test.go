@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -165,5 +166,56 @@ func TestAdminSuccessfulCallsDoNotUseUpTheGuessBudget(t *testing.T) {
 		if got := doFrom(h, "203.0.113.9:1", http.MethodGet, "/admin/keys", testAdminToken); got != http.StatusOK {
 			t.Fatalf("call %d with the right token = %d, want 200", i, got)
 		}
+	}
+}
+
+func TestAdminPurgeUnusedRequiresTheTokenAndAValidAge(t *testing.T) {
+	h, _ := adminServer(t)
+	if rr := do(h, http.MethodPost, "/admin/keys/purge-unused?older_than_days=30", "", "wrong"); rr.Code != http.StatusUnauthorized {
+		t.Errorf("purge with a wrong token = %d, want 401", rr.Code)
+	}
+	for _, q := range []string{"", "?older_than_days=", "?older_than_days=0", "?older_than_days=-1", "?older_than_days=abc", "?older_than_days=99999999"} {
+		if rr := do(h, http.MethodPost, "/admin/keys/purge-unused"+q, "", testAdminToken); rr.Code != http.StatusBadRequest {
+			t.Errorf("purge%s = %d, want 400", q, rr.Code)
+		}
+	}
+}
+
+func TestAdminPurgeUnusedReportsHowManyKeysItRemoved(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.AdminToken = testAdminToken
+	rig := newTokenRig(t, cfg)
+	ctx := context.Background()
+	for _, label := range []string{"squatter-a", "squatter-b"} {
+		if _, err := rig.store.Issue(ctx, label, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	used, _ := rig.store.Issue(ctx, "active", 0)
+	if _, err := rig.store.Verify(ctx, used); err != nil {
+		t.Fatal(err)
+	}
+	h := rig.srv.Router()
+	const target = "/admin/keys/purge-unused?older_than_days=1"
+
+	rr := do(h, http.MethodPost, target, "", testAdminToken)
+	if rr.Code != http.StatusOK || strings.TrimSpace(rr.Body.String()) != `{"purged":0}` {
+		t.Fatalf("purge of brand new keys = %d %s, want 200 {\"purged\":0}", rr.Code, rr.Body.String())
+	}
+
+	db, err := sql.Open("sqlite", "file:"+rig.dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE keys SET created_at = 1`); err != nil {
+		t.Fatal(err)
+	}
+	rr = do(h, http.MethodPost, target, "", testAdminToken)
+	if rr.Code != http.StatusOK || strings.TrimSpace(rr.Body.String()) != `{"purged":2}` {
+		t.Fatalf("purge of old keys = %d %s, want 200 {\"purged\":2}", rr.Code, rr.Body.String())
+	}
+	if _, err := rig.store.Verify(ctx, used); err != nil {
+		t.Errorf("the key that had sent was purged: %v", err)
 	}
 }

@@ -64,6 +64,7 @@ func (s *Server) Router() http.Handler {
 	if s.cfg.AdminEnabled() {
 		mux.HandleFunc("GET /admin/keys", s.requireAdmin(s.handleAdminListKeys))
 		mux.HandleFunc("POST /admin/keys/{id}/revoke", s.requireAdmin(s.handleAdminRevokeKey))
+		mux.HandleFunc("POST /admin/keys/purge-unused", s.requireAdmin(s.handleAdminPurgeUnused))
 	}
 	return recoverer(mux)
 }

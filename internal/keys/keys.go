@@ -167,7 +167,8 @@ COMMIT;`)
 // public URL). max bounds the total number of keys this store will ever issue - including
 // revoked ones, since revoking a key does not reopen the slot it used - so /v1/register
 // cannot grow the key table without bound; zero or negative disables the ceiling. Returns
-// ErrRegistrationCeiling once max is reached.
+// ErrRegistrationCeiling once max is reached. Only PurgeUnused reopens slots, and logs when
+// the count crosses 80% of max and again when it reaches max.
 //
 // The count-then-insert runs in one transaction, race-free for the same reason BindToken is
 // (see Open): the whole relay shares one connection, so a second Issue call blocks until
@@ -185,8 +186,8 @@ func (s *Store) Issue(ctx context.Context, label string, max int64) (string, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var count int64
 	if max > 0 {
-		var count int64
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM keys`).Scan(&count); err != nil {
 			return "", err
 		}
@@ -202,7 +203,22 @@ func (s *Store) Issue(ctx context.Context, label string, max int64) (string, err
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+	if max > 0 {
+		logCeilingProgress(count+1, max)
+	}
 	return plain, nil
+}
+
+// ceilingWarnPercent is how full the registration ceiling gets before the operator is told.
+const ceilingWarnPercent = 80
+
+func logCeilingProgress(issued, max int64) {
+	switch issued {
+	case max:
+		log.Printf("relay: registration ceiling reached (%d keys); new servers are refused until keys are purged or RELAY_MAX_REGISTRATIONS is raised", max)
+	case max * ceilingWarnPercent / 100:
+		log.Printf("relay: %d of %d registrations used; purge unused keys (POST /admin/keys/purge-unused) or raise RELAY_MAX_REGISTRATIONS", issued, max)
+	}
 }
 
 // Verify returns the key for a plaintext secret if it exists and is not revoked, stamping
@@ -285,6 +301,36 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// PurgeUnused deletes keys that have never sent anything and were issued more than olderThan
+// ago, revoked or not, and returns how many it removed. It is the only way a registration
+// slot is given back, so squatted keys cannot hold the ceiling forever. Key ids are never
+// reused, so a purged key cannot come back as someone else's.
+func (s *Store) PurgeUnused(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	cutoff := time.Now().Add(-olderThan).Unix()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM tokens WHERE key_id IN (SELECT id FROM keys WHERE last_used_at IS NULL AND created_at < ?)`, cutoff); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM keys WHERE last_used_at IS NULL AND created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ErrTokenLimit is returned by BindToken when a key already holds its maximum of bound tokens.

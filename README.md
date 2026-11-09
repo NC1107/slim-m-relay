@@ -38,6 +38,8 @@ Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`
 Rate limiting is per-instance and in-process: it lives in the relay's own memory, not a shared store, so running more than one replica multiplies the effective limits rather than sharing one budget across them.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
 Revoking a key also drops its device-token bindings.
+Keys that registered but never sent anything can be cleared with `POST /admin/keys/purge-unused`, which frees their registration slots if someone squats the ceiling.
+It is deliberately manual: a slim-m server whose key is purged gets `401` from every send until it is given a new one, so choose an age that no real server is still waiting inside.
 
 ### Token-to-key binding
 
@@ -69,6 +71,7 @@ A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned,
 | `GET` | `/healthz` | none | Liveness. |
 | `GET` | `/admin/keys` | `Authorization: Bearer <admin token>` | List issued keys (metadata only). |
 | `POST` | `/admin/keys/{id}/revoke` | `Authorization: Bearer <admin token>` | Revoke a key. |
+| `POST` | `/admin/keys/purge-unused?older_than_days=N` | `Authorization: Bearer <admin token>` | Delete keys that never sent anything and were issued more than `N` days ago (`N` is required and at least 1). Returns `{"purged": n}`. |
 
 Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set to at least 32 characters; a shorter token leaves them disabled and the relay says so at startup.
 Generate one with `openssl rand -hex 32`.
@@ -133,7 +136,7 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_TRUST_PROXY_HOPS` | `1` | How many proxies are in front of the relay when `RELAY_TRUST_PROXY` is on: the client is the entry that many places from the right of `X-Forwarded-For`. |
 | `RELAY_REGISTER_PER_HOUR` | `5` | Per-IP registration rate. |
 | `RELAY_REGISTER_BURST` | `3` | Per-IP registration burst. |
-| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will ever mint, across every IP, forever (revoked keys still count against it). Zero or negative disables the ceiling. |
+| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will hold, across every IP (revoked keys still count against it). Only `POST /admin/keys/purge-unused` gives slots back. The relay logs when 80% is used and again at the ceiling. Zero or negative disables the ceiling. |
 | `RELAY_SEND_ADMIT_PER_MINUTE` | `600` | Per-IP admission rate on `/v1/send`, checked before the bearer key is looked up so unauthenticated garbage never reaches the key store. Sized well above any honest server's send rate. |
 | `RELAY_SEND_ADMIT_BURST` | `120` | Per-IP admission burst on `/v1/send`. |
 | `RELAY_SEND_PER_MINUTE` | `120` | Per-key send rate. |

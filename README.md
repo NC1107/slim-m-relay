@@ -111,6 +111,9 @@ docker run -d \
   slim-m-relay
 ```
 
+The image declares a `HEALTHCHECK` that runs `relay -healthcheck` against `/healthz`, so `docker ps` shows whether the relay is healthy, with no `--health-cmd` needed.
+A relay whose key store is unreadable reports `unhealthy`; Docker does not restart it by itself, so pair it with an autoheal tool or an orchestrator if you want that.
+
 Put the relay behind whatever reverse proxy you already run (Caddy, Traefik, nginx).
 By default the relay ignores `X-Forwarded-For` entirely and keys per-IP rate limiting on the raw socket address, since every proxy the list above sets that header at *appends* its view of the peer - the leftmost entry is always whatever the client itself sent, and trusting it by default would let any caller spoof its way to an unlimited number of rate-limit identities.
 If you do run behind such a proxy and want registration limits keyed on the real client rather than the proxy's own address, set `RELAY_TRUST_PROXY=true`.
@@ -162,7 +165,8 @@ go test ./...
 go build ./cmd/relay
 ```
 
-Go 1.26, no CGO (the SQLite driver is pure Go), single static binary.
+Go 1.26 or newer, no CGO (the SQLite driver is pure Go), single static binary.
+The Go minor in the Dockerfile's `FROM golang:` line is the one CI installs, so the image is built with the toolchain the tests ran on.
 
 ## License
 

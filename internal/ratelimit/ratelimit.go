@@ -7,6 +7,7 @@ package ratelimit
 
 import (
 	"container/list"
+	"math"
 	"sync"
 	"time"
 )
@@ -61,6 +62,16 @@ func New(perMinute float64, burst int) *Limiter {
 		}
 	}
 	return l
+}
+
+// RetryAfter is how long a refused caller should wait for one token to refill, rounded up
+// to whole seconds for a Retry-After header. Zero when the limiter never refills.
+func (l *Limiter) RetryAfter() time.Duration {
+	if l.rate <= 0 {
+		return 0
+	}
+	// The epsilon keeps float error in rate = perMinute/60 from rounding 720.0000000001 up a second.
+	return time.Duration(math.Ceil(1/l.rate-1e-6)) * time.Second
 }
 
 // Allow reports whether an action for key may proceed, consuming one token if so.

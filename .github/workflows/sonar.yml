@@ -27,9 +27,7 @@ jobs:
         with:
           # Full history, so new-code and blame attribution are accurate.
           fetch-depth: 0
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.26"
+      - uses: ./.github/actions/setup-go
       - name: test with coverage
         run: go test -coverprofile=coverage.out ./...
       - name: cache sonar packages

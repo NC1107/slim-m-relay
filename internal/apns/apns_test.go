@@ -3,9 +3,11 @@
 package apns
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -39,8 +41,14 @@ func TestSendMapsResponseToStatus(t *testing.T) {
 		{"unregistered token", &apns2.Response{StatusCode: 410, Reason: apns2.ReasonUnregistered}, nil, push.StatusUnregistered},
 		{"bad device token", &apns2.Response{StatusCode: 400, Reason: apns2.ReasonBadDeviceToken}, nil, push.StatusUnregistered},
 		{"expired token", &apns2.Response{StatusCode: 410, Reason: apns2.ReasonExpiredToken}, nil, push.StatusUnregistered},
-		{"other rejection", &apns2.Response{StatusCode: 403, Reason: apns2.ReasonForbidden}, nil, push.StatusError},
-		{"transport error", nil, errors.New("boom"), push.StatusError},
+		{"provider credential rejected", &apns2.Response{StatusCode: 403, Reason: apns2.ReasonForbidden}, nil, push.StatusRetry},
+		{"expired provider token", &apns2.Response{StatusCode: 403, Reason: apns2.ReasonExpiredProviderToken}, nil, push.StatusRetry},
+		{"throttled", &apns2.Response{StatusCode: 429, Reason: apns2.ReasonTooManyRequests}, nil, push.StatusRetry},
+		{"gateway trouble", &apns2.Response{StatusCode: 503, Reason: apns2.ReasonServiceUnavailable}, nil, push.StatusRetry},
+		{"internal error", &apns2.Response{StatusCode: 500, Reason: apns2.ReasonInternalServerError}, nil, push.StatusRetry},
+		{"payload too large", &apns2.Response{StatusCode: 413, Reason: apns2.ReasonPayloadTooLarge}, nil, push.StatusRejected},
+		{"bad topic", &apns2.Response{StatusCode: 400, Reason: apns2.ReasonBadTopic}, nil, push.StatusRejected},
+		{"transport error", nil, errors.New("boom"), push.StatusRetry},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -277,5 +285,27 @@ func TestSendEscapesTheDeviceTokenForTheRequestPath(t *testing.T) {
 
 	if len(fc.got) != 1 || fc.got[0].DeviceToken != "ab%2Fcd%231%3Fx" {
 		t.Fatalf("device token on the wire = %+v, want it path-escaped", fc.got)
+	}
+}
+
+// A dead provider credential fails every message of a request the same way, and dispatch
+// sends them one at a time, so it must log once per request scope instead of once per message.
+func TestCredentialDeathLogsOncePerRequest(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	fc := &fakeClient{resp: &apns2.Response{StatusCode: 403, Reason: apns2.ReasonInvalidProviderToken}}
+	s := &Sender{client: fc, bundleID: "com.example.app"}
+	for request := 0; request < 2; request++ {
+		ctx := push.WithRequestScope(context.Background())
+		for i := 0; i < 100; i++ {
+			s.Send(ctx, []push.Message{{Token: "tok", Kind: push.KindWake, Payload: "cipher"}})
+		}
+	}
+
+	if got := strings.Count(buf.String(), "provider credential"); got != 2 {
+		t.Errorf("logged %d credential lines across 2 requests of 100 sends, want 2", got)
 	}
 }

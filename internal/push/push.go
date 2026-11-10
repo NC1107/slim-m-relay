@@ -59,7 +59,9 @@ type Message struct {
 	Payload string
 }
 
-// Status is the delivery outcome for one token.
+// Status is the delivery outcome for one token. Relays that predate StatusRejected and
+// StatusRetry answered "error" for both; this one never does, so a server can still read
+// "error" as "possibly an older relay" and nothing newer.
 type Status string
 
 const (
@@ -71,8 +73,15 @@ const (
 	// StatusForbidden means the token is bound to a different key (see internal/keys) and
 	// this send was refused, so one self-hosted server cannot harass another's devices.
 	StatusForbidden Status = "forbidden"
-	// StatusError means the send failed for some other reason and may be worth a retry.
-	StatusError Status = "error"
+	// StatusRejected means the relay or the provider refused this message for good: an
+	// unknown platform or kind, a malformed or oversized token or payload, a token budget
+	// spent, or a provider answer that never changes for the same message. Resending the
+	// same message cannot succeed.
+	StatusRejected Status = "rejected"
+	// StatusRetry means the message was fine but could not be delivered right now: the
+	// provider was overloaded or unreachable, the call budget was spent, or the relay's own
+	// provider setup needs its operator. A later attempt may succeed.
+	StatusRetry Status = "retry"
 	// StatusNotAttempted means the request's per-request deadline was reached before this
 	// message's turn in the worker pool; the provider was never contacted. The caller should
 	// retry only these, not the whole batch, since everything else already has a real outcome.
@@ -91,7 +100,7 @@ type Sender interface {
 	Send(ctx context.Context, msgs []Message) []Result
 }
 
-// Unconfigured returns a Sender that rejects every message with StatusError, logging why
+// Unconfigured returns a Sender that answers every message with StatusRetry, logging why
 // at most once per request (see WithRequestScope). main wires this in for whichever
 // platform is missing its credentials, so the relay can start and serve every other
 // endpoint - registration, sending on the other platform, admin, health - without secrets
@@ -116,26 +125,25 @@ func WithRequestScope(ctx context.Context) context.Context {
 
 func (u unconfigured) Send(ctx context.Context, msgs []Message) []Result {
 	if len(msgs) > 0 {
-		u.logRejection(ctx)
+		LogOncePerRequest(ctx, "unconfigured:"+u.platform, "relay: %s not configured; rejecting message(s)", u.platform)
 	}
 	out := make([]Result, len(msgs))
 	for i, m := range msgs {
-		out[i] = Result{Token: m.Token, Status: StatusError}
+		out[i] = Result{Token: m.Token, Status: StatusRetry}
 	}
 	return out
 }
 
-// logRejection logs that this platform is unconfigured at most once per request scope (see
-// WithRequestScope), keyed by platform so an iOS and an Android rejection in the same
-// request each still get their own line. A call made outside any request scope - direct use
-// in a test, say - logs every time, matching the old unconditional behaviour.
-func (u unconfigured) logRejection(ctx context.Context) {
+// LogOncePerRequest logs at most one line per key within a request scope (see
+// WithRequestScope), so a failure that every message of a batch hits - a dead provider
+// credential, an unconfigured platform - costs one line per request, not one per message.
+// A call made outside any request scope, direct use in a test say, logs every time.
+func LogOncePerRequest(ctx context.Context, key, format string, args ...any) {
 	scope, ok := ctx.Value(requestScopeKey{}).(*sync.Map)
-	if !ok {
-		log.Printf("relay: %s not configured; rejecting message(s)", u.platform)
-		return
+	if ok {
+		if _, alreadyLogged := scope.LoadOrStore(key, struct{}{}); alreadyLogged {
+			return
+		}
 	}
-	if _, alreadyLogged := scope.LoadOrStore(u.platform, struct{}{}); !alreadyLogged {
-		log.Printf("relay: %s not configured; rejecting message(s) for this request", u.platform)
-	}
+	log.Printf(format, args...)
 }

@@ -73,8 +73,8 @@ func TestSendRefusesTokensThatCouldRewriteTheApnsRequestPath(t *testing.T) {
 		t.Run(fmt.Sprintf("case%d", i), func(t *testing.T) {
 			rig := newTokenRig(t, defaultCfg())
 			res := rig.send(t, rig.newKey(t), "ios", tok)
-			if len(res) != 1 || res[0].Status != push.StatusError {
-				t.Fatalf("results = %+v, want one error", res)
+			if len(res) != 1 || res[0].Status != push.StatusRejected {
+				t.Fatalf("results = %+v, want one rejected", res)
 			}
 			if len(rig.ios.got) != 0 {
 				t.Fatalf("the token reached APNs: %+v", rig.ios.got)
@@ -91,8 +91,8 @@ func TestSendRefusesAndroidTokensOutsideTheFirebaseAlphabet(t *testing.T) {
 		t.Run(fmt.Sprintf("case%d", i), func(t *testing.T) {
 			rig := newTokenRig(t, defaultCfg())
 			res := rig.send(t, rig.newKey(t), "android", tok)
-			if len(res) != 1 || res[0].Status != push.StatusError {
-				t.Fatalf("results = %+v, want one error", res)
+			if len(res) != 1 || res[0].Status != push.StatusRejected {
+				t.Fatalf("results = %+v, want one rejected", res)
 			}
 			if n := countBoundTokens(t, rig.dbPath); n != 0 {
 				t.Fatalf("tokens rows = %d, want 0", n)

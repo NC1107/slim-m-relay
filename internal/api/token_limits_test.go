@@ -82,8 +82,8 @@ func TestSendRefusesMalformedTokensWithoutStoringThem(t *testing.T) {
 			srv, plain, path := openTokenTestServer(t, defaultCfg())
 			for _, platform := range []string{"ios", "android"} {
 				res := sendTokens(t, srv, plain, platform, tok)
-				if len(res) != 1 || res[0].Status != push.StatusError {
-					t.Fatalf("%s: got %d results, first status %q, want one error", platform, len(res), res[0].Status)
+				if len(res) != 1 || res[0].Status != push.StatusRejected {
+					t.Fatalf("%s: got %d results, first status %q, want one rejected", platform, len(res), res[0].Status)
 				}
 			}
 			if n := countBoundTokens(t, path); n != 0 {
@@ -120,7 +120,7 @@ func TestSendStopsBindingNewTokensAtThePerKeyCap(t *testing.T) {
 	for i, r := range res {
 		want := push.StatusDelivered
 		if i >= 3 {
-			want = push.StatusError
+			want = push.StatusRejected
 		}
 		if r.Status != want {
 			t.Errorf("token %d status = %q, want %q", i, r.Status, want)

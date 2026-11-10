@@ -1,5 +1,5 @@
 # Multi-stage build producing a tiny static binary on a distroless base.
-FROM golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
+FROM golang:1.27-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS build
 WORKDIR /src
 
 # Cache modules first.
@@ -23,4 +23,6 @@ VOLUME ["/data"]
 ENV RELAY_DB_PATH=/data/relay.db
 EXPOSE 8090
 USER nonroot:nonroot
+# The distroless base has no shell or curl, so the relay binary probes itself.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["/app/relay", "-healthcheck"]
 ENTRYPOINT ["/app/relay"]

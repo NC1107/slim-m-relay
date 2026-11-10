@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+name: setup-go
+description: Installs the Go minor the Dockerfile builds the image with, so CI tests the toolchain that ships.
+
+runs:
+  using: composite
+  steps:
+    - name: read the Go minor from the Dockerfile
+      id: minor
+      shell: bash
+      run: |
+        minor="$(sed -nE 's/^FROM golang:([0-9]+\.[0-9]+)[-@ ].*/\1/p' "${GITHUB_WORKSPACE}/Dockerfile" | head -n1)"
+        if [ -z "${minor}" ]; then
+          echo "::error::no 'FROM golang:<major>.<minor>' line in the Dockerfile"
+          exit 1
+        fi
+        echo "go-version=${minor}" >> "${GITHUB_OUTPUT}"
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: ${{ steps.minor.outputs.go-version }}

@@ -56,11 +56,11 @@ var contractCases = []contractCase{
 	// A payload exactly at the documented ceiling must still go through.
 	{token: "contract-payload-at-limit", wantStatus: "delivered", wantPlatform: "android"},
 	// One byte over the ceiling must be rejected, never dispatched.
-	{token: "contract-payload-over-limit", wantStatus: "error"},
+	{token: "contract-payload-over-limit", wantStatus: "rejected"},
 	// A kind outside {message, mention, call, call_end, security, wake, voice, admin_alert} must be rejected.
-	{token: "contract-unknown-kind", wantStatus: "error"},
+	{token: "contract-unknown-kind", wantStatus: "rejected"},
 	// A platform outside {ios, android} must be rejected.
-	{token: "contract-unknown-platform", wantStatus: "error"},
+	{token: "contract-unknown-platform", wantStatus: "rejected"},
 }
 
 // TestPushRelayContract drives slimm-server's real, freshly captured

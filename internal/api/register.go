@@ -29,7 +29,7 @@ const maxLabelLen = 256
 // only as a hint that helps an admin tell keys apart.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !s.registerLim.Allow(s.clientIP(r)) {
-		writeErr(w, http.StatusTooManyRequests, "too many registrations from this address, try again later")
+		writeRateLimited(w, s.registerLim, "too many registrations from this address, try again later")
 		return
 	}
 	var req registerReq

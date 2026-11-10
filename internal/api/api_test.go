@@ -96,7 +96,7 @@ func (s *slowSender) Send(ctx context.Context, msgs []push.Message) []push.Resul
 	select {
 	case <-time.After(s.delay):
 	case <-ctx.Done():
-		status = push.StatusError
+		status = push.StatusRetry
 	}
 
 	s.mu.Lock()
@@ -282,8 +282,8 @@ func TestSendCallKindHasTighterPerKeyLimit(t *testing.T) {
 	if resp.Results[0].Status != push.StatusDelivered {
 		t.Errorf("first call = %+v, want delivered (within the call burst of 1)", resp.Results[0])
 	}
-	if resp.Results[1].Status != push.StatusError {
-		t.Errorf("second call = %+v, want error (call burst spent)", resp.Results[1])
+	if resp.Results[1].Status != push.StatusRetry {
+		t.Errorf("second call = %+v, want retry (call burst spent, a later attempt may pass)", resp.Results[1])
 	}
 	if resp.Results[2].Status != push.StatusDelivered {
 		t.Errorf("wake = %+v, want delivered (a non-call kind is unaffected by the call limiter)", resp.Results[2])
@@ -358,8 +358,8 @@ func TestSendRejectsUnknownPlatformAndKind(t *testing.T) {
 		t.Fatalf("results = %+v, want 2", resp.Results)
 	}
 	for _, r := range resp.Results {
-		if r.Status != push.StatusError {
-			t.Errorf("result %+v, want error", r)
+		if r.Status != push.StatusRejected {
+			t.Errorf("result %+v, want rejected", r)
 		}
 	}
 	if len(ios.got) != 0 || len(android.got) != 0 {
@@ -444,8 +444,8 @@ func TestSendRejectsOversizedPayload(t *testing.T) {
 	}
 	var resp sendResp
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
-	if len(resp.Results) != 1 || resp.Results[0].Status != push.StatusError {
-		t.Fatalf("results = %+v, want a single error result", resp.Results)
+	if len(resp.Results) != 1 || resp.Results[0].Status != push.StatusRejected {
+		t.Fatalf("results = %+v, want a single rejected result", resp.Results)
 	}
 	if len(ios.got) != 0 {
 		t.Error("an oversized payload must never reach the provider")
@@ -600,9 +600,6 @@ func TestDispatchMarksUnattemptedAsNotAttempted(t *testing.T) {
 	}
 	results := make([]push.Result, len(items))
 
-	// A deadline nearer than cfg.SendTimeoutSeconds still wins: WithTimeout takes the
-	// sooner of the two, which lets this test stay fast without shrinking the real config
-	// default.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	srv.dispatch(ctx, items, results)

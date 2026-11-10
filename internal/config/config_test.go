@@ -5,6 +5,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -33,7 +34,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.RegisterPerHour != 5 || c.RegisterBurst != 3 || c.SendPerMinute != 120 || c.SendBurst != 60 {
 		t.Errorf("limits = %d %d %d %d, want 5 3 120 60", c.RegisterPerHour, c.RegisterBurst, c.SendPerMinute, c.SendBurst)
 	}
-	if c.CallSendPerMinute != 10 || c.CallSendBurst != 5 || c.MaxMessages != 500 || c.SendConcurrency != 8 || c.SendTimeoutSeconds != 20 {
+	if c.CallSendPerMinute != 10 || c.CallSendBurst != 5 || c.MaxMessages != 500 || c.SendConcurrency != 8 || c.SendTimeoutSeconds != 8 {
 		t.Errorf("call/message limits = %+v", c)
 	}
 	if c.SendAdmitPerMinute != 600 || c.SendAdmitBurst != 120 {
@@ -169,6 +170,38 @@ func TestAdminEnabledNeedsALongEnoughToken(t *testing.T) {
 	for token, want := range cases {
 		if got := (Config{AdminToken: token}).AdminEnabled(); got != want {
 			t.Errorf("AdminEnabled with a %d char token = %v, want %v", len(token), got, want)
+		}
+	}
+}
+
+// slimServerRelayTimeoutSeconds is how long slim-m's server waits for a send (RELAY_TIMEOUT in
+// slimm-server's push/relay.rs, which pins the same pairing). A relay deadline at or past it
+// means a slow provider makes the server give up before it sees any per-token result.
+const slimServerRelayTimeoutSeconds = 10
+
+func TestDefaultSendDeadlineStaysUnderTheServersTimeout(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SendTimeoutSeconds >= slimServerRelayTimeoutSeconds {
+		t.Errorf("default send deadline %ds is not under the server's %ds relay timeout", c.SendTimeoutSeconds, slimServerRelayTimeoutSeconds)
+	}
+}
+
+func TestHTTPWriteTimeoutFollowsTheSendDeadline(t *testing.T) {
+	for seconds, want := range map[int]time.Duration{
+		8:   38 * time.Second,
+		120: 150 * time.Second,
+		0:   0,
+		-1:  0,
+	} {
+		c := Config{SendTimeoutSeconds: seconds}
+		if got := c.HTTPWriteTimeout(); got != want {
+			t.Errorf("send deadline %ds: write timeout = %v, want %v", seconds, got, want)
+		}
+		if seconds > 0 && c.HTTPWriteTimeout() <= time.Duration(seconds)*time.Second {
+			t.Errorf("send deadline %ds: the write timeout would cut off the response of a request that used all of it", seconds)
 		}
 	}
 }

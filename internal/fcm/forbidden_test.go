@@ -51,8 +51,8 @@ func TestSenderIDMismatchIsUnregisteredNotCredentialDeath(t *testing.T) {
 
 func TestOtherForbiddenStillReadsAsCredentialDeath(t *testing.T) {
 	status, logs := sendForbidden(t, http.StatusForbidden, permissionDenied)
-	if status != push.StatusError {
-		t.Errorf("status = %s, want error for a 403 that is not SENDER_ID_MISMATCH", status)
+	if status != push.StatusRetry {
+		t.Errorf("status = %s, want retry for a 403 that is not SENDER_ID_MISMATCH", status)
 	}
 	if !strings.Contains(logs, "service-account credential") {
 		t.Errorf("a plain 403 must still log the credential failure, got %q", logs)
@@ -61,7 +61,7 @@ func TestOtherForbiddenStillReadsAsCredentialDeath(t *testing.T) {
 
 func TestUnauthorizedStillReadsAsCredentialDeath(t *testing.T) {
 	status, logs := sendForbidden(t, http.StatusUnauthorized, `{"error":{"code":401,"status":"UNAUTHENTICATED"}}`)
-	if status != push.StatusError || !strings.Contains(logs, "service-account credential") {
-		t.Errorf("401 = %s, logs %q; want error plus the credential log", status, logs)
+	if status != push.StatusRetry || !strings.Contains(logs, "service-account credential") {
+		t.Errorf("401 = %s, logs %q; want retry plus the credential log", status, logs)
 	}
 }

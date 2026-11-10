@@ -32,6 +32,7 @@ It does not log tokens or payload content, only counts and error codes.
 3. When something happens worth waking a device for, the server calls `POST /v1/send` with its key and a batch of `{platform, token, kind, payload}`.
    The relay forwards each message to APNs or FCM depending on its platform, through a bounded worker pool under a hard per-request deadline, and returns a per-token result so the server can prune tokens the provider reports as dead.
    A message the deadline cut off before its turn comes back as `not_attempted` rather than any other status, so the server knows to retry only those.
+   The deadline starts when the keys are checked, covers binding every token in one transaction and then the provider calls, and defaults to 8 seconds so it ends before the 10 seconds slim-m's server waits.
 
 Keys are stored as SHA-256 hashes in a small SQLite file, so a leak of the database yields nothing usable.
 Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`, and sending is rate-limited per key, with a tighter limit specifically on `call` kind pushes since a call rings a device and is the most abusable kind.
@@ -58,7 +59,7 @@ A hostile server must still be unable to take a token away from a real one or to
 - Bindings created before this change keep working: the tokens table is rebuilt on first start with the same rows, one per key.
 
 The home server reads the `forbidden` result, counts it, and shows the count in its admin push view, so a server that is silently shut out is visible.
-A token must be 1 to 1024 characters (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
+A token must be 1 to 1024 characters (the server already refuses to register a longer one), or it comes back as `rejected` and is never stored.
 An iOS token may use only letters, digits, `-` and `_`, because it becomes part of the APNs request path, and it is lowercased before it is bound or sent so a case variant cannot be a second binding for the same device; the result still echoes the spelling the server sent.
 An Android token may use only letters, digits, `-`, `_`, `.` and `:`, the alphabet Firebase issues.
 A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
@@ -68,7 +69,7 @@ A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned,
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | `POST` | `/v1/register` | none (IP rate-limited) | Mint a key. Optional body `{"publicUrl": "..."}` is recorded, unverified, as an admin label. |
-| `POST` | `/v1/send` | `Authorization: Bearer <key>` | Forward `{"messages": [{"platform","token","kind","payload"}]}` to APNs or FCM by platform. Returns `{"results": [{"token","status"}]}` where status is `delivered`, `unregistered`, `forbidden`, `not_attempted`, or `error`. |
+| `POST` | `/v1/send` | `Authorization: Bearer <key>` | Forward `{"messages": [{"platform","token","kind","payload"}]}` to APNs or FCM by platform. Returns `{"results": [{"token","status"}]}` where status is one of the values listed under Statuses below. A `429` carries a `Retry-After` header. |
 | `GET` | `/healthz` | none | Liveness. |
 | `GET` | `/admin/keys` | `Authorization: Bearer <admin token>` | List issued keys (metadata only). |
 | `POST` | `/admin/keys/{id}/revoke` | `Authorization: Bearer <admin token>` | Revoke a key. |
@@ -87,6 +88,23 @@ The `token` for a `call` on iOS must be the device's PushKit VoIP token, not its
 `call_end` tells a device to stop a ring it may still be showing; on iOS it is a silent background push on the plain topic, never a VoIP push, since iOS terminates an app that takes a VoIP push without reporting a new call.
 `call` and `call_end` expire after 30 seconds (APNs `apns-expiration`, FCM `android.ttl`), matching the home server's ring timeout, so a device that reconnects late never rings for a call that is already over.
 Every Android push is a high-priority data-only message; the app builds any notification itself.
+
+### Statuses
+
+Every result carries exactly one status.
+
+| Status | Meaning |
+|--------|---------|
+| `delivered` | The provider accepted the message. |
+| `unregistered` | The provider reports the token dead; the caller should drop it. |
+| `forbidden` | The token already has `RELAY_MAX_KEYS_PER_TOKEN` other keys bound, so this key may not deliver to it. |
+| `not_attempted` | The request's deadline passed before this message's turn; the provider was never contacted. |
+| `rejected` | Refused for good: an unknown platform or kind, a malformed or oversized token or payload, the key's token cap, or an answer from the provider that never changes for the same message. Resending the same message cannot succeed. |
+| `retry` | The message was fine but could not be delivered now: the provider was overloaded or unreachable, the key's `call` budget was spent, or the relay's provider credentials need its operator. A later attempt may succeed. |
+
+Relays from before `rejected` and `retry` answered `error` for both, so a server could not tell a relay that predates a kind from a provider having a bad minute.
+This relay never answers `error`.
+A server that still sees it knows it is talking to an older relay, and one that does not recognize `rejected` or `retry` treats them like any other status it takes no action on.
 
 ## Running it
 
@@ -146,11 +164,11 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_CALL_SEND_BURST` | `5` | Per-key burst for `call` kind pushes. |
 | `RELAY_MAX_MESSAGES` | `500` | Device tokens allowed in one `/v1/send`. |
 | `RELAY_SEND_CONCURRENCY` | `8` | Provider sends run at once, per `/v1/send` request, through a bounded worker pool. |
-| `RELAY_SEND_TIMEOUT_SECONDS` | `20` | Hard wall-clock deadline for one `/v1/send` request's provider dispatch. A message not yet attempted when it fires comes back as `not_attempted`. `0` or negative disables the deadline entirely rather than expiring it instantly. |
+| `RELAY_SEND_TIMEOUT_SECONDS` | `8` | Hard wall-clock deadline for one `/v1/send` request's token binding and provider dispatch. A message not yet attempted when it fires comes back as `not_attempted`. Keep it under the 10 seconds slim-m's server waits for a send, or the server gives up before it sees the results. The HTTP write timeout is this plus 30 seconds. `0` or negative disables both the deadline and the write timeout. |
 | `RELAY_TOKEN_RETENTION_DAYS` | `90` | How long a device-token binding may go without its owning key sending to it before it is pruned. A send always refreshes the clock, so an actively used token is never at risk. `0` or negative disables pruning, leaving the tokens table to grow without bound. |
 | `RELAY_MAX_KEYS_PER_TOKEN` | `8` | How many keys may deliver to one device token. A key past it comes back as `forbidden`. `0` or negative disables the cap. |
 | `RELAY_BINDING_IDLE_DAYS` | `14` | How long a binding on a full token must be unused before a new key may replace it. `0` or negative never replaces. |
-| `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `error`; one the key already owns keeps working. `0` or negative disables the cap. |
+| `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `rejected`; one the key already owns keeps working. `0` or negative disables the cap. |
 
 The relay refuses to start when a per-minute or per-hour rate, a burst, or `RELAY_MAX_MESSAGES` is below 1, or when `RELAY_TRUST_PROXY_HOPS` is below 1 with `RELAY_TRUST_PROXY` on, and the error names the variable.
 A zero rate or burst would otherwise let one caller through once and then refuse it forever.

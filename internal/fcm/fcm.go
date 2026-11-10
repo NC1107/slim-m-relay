@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"time"
 
@@ -35,14 +34,15 @@ const (
 // failure. FCM v1 pretty-prints its error JSON by default, and a real INVALID_ARGUMENT
 // body naming a malformed registration token runs to several hundred bytes on its own; a
 // tighter cap risks truncating it mid-document, which makes json.Unmarshal fail, which
-// makes tokenFieldViolation return false, which misclassifies a dead token as StatusError
-// (retried forever) instead of StatusUnregistered. 16 KiB comfortably holds any real
+// makes tokenFieldViolation return false, which misclassifies a dead token as StatusRejected
+// instead of StatusUnregistered. 16 KiB comfortably holds any real
 // provider error while still bounding memory per response.
 const maxErrorBodyBytes = 16 * 1024
 
 // Sender holds the FCM credentials and posts messages to the REST API.
 type Sender struct {
 	tokens    oauth2.TokenSource
+	gate      tokenGate
 	projectID string
 	http      *http.Client
 	endpoint  string
@@ -81,10 +81,10 @@ func (s *Sender) ProjectID() string { return s.projectID }
 // payload; the caller decides what to record from the returned statuses.
 func (s *Sender) Send(ctx context.Context, msgs []push.Message) []push.Result {
 	results := make([]push.Result, len(msgs))
-	tok, err := s.token(ctx)
+	tok, err := s.gate.token(ctx, s.tokens)
 	if err != nil {
 		for i, m := range msgs {
-			results[i] = push.Result{Token: m.Token, Status: push.StatusError}
+			results[i] = push.Result{Token: m.Token, Status: push.StatusRetry}
 		}
 		return results
 	}
@@ -93,32 +93,6 @@ func (s *Sender) Send(ctx context.Context, msgs []push.Message) []push.Result {
 		results[i] = push.Result{Token: m.Token, Status: s.sendOne(ctx, url, tok.AccessToken, m)}
 	}
 	return results
-}
-
-// token fetches an access token bounded by ctx. oauth2.TokenSource.Token() itself takes no
-// context and so cannot be interrupted directly - that is what let a blackholed OAuth token
-// endpoint hold a /v1/send request open past its configured deadline regardless of how the
-// deadline was enforced elsewhere. Running the fetch in its own goroutine and racing it
-// against ctx.Done() is what makes the caller's deadline actually cut this off. If ctx wins,
-// the goroutine is simply abandoned rather than killed - Go has no way to do that - but it
-// can never run past New's http.Client timeout, so it still finishes and exits on its own,
-// its result silently discarded into the buffered channel.
-func (s *Sender) token(ctx context.Context) (*oauth2.Token, error) {
-	type result struct {
-		tok *oauth2.Token
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		tok, err := s.tokens.Token()
-		ch <- result{tok, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.tok, r.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 }
 
 func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message) push.Status {
@@ -138,41 +112,51 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return push.StatusError
+		return push.StatusRetry
 	}
 	req.Header.Set("Authorization", "Bearer "+access)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return push.StatusError
+		return push.StatusRetry
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 300 {
 		return push.StatusDelivered
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	return classifyFailure(ctx, resp.StatusCode, raw)
+}
+
+// classifyFailure maps a non-2xx FCM answer to a status. A message the provider will never
+// accept is rejected; a dead token is unregistered; everything the relay or Google can fix
+// by itself, or an operator can fix by touching the credential, is worth a retry.
+func classifyFailure(ctx context.Context, status int, raw []byte) push.Status {
 	code := errorCode(raw)
-	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && code != "SENDER_ID_MISMATCH" {
+	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && code != "SENDER_ID_MISMATCH" {
 		// Whole-pipeline credential death, not per-token noise: the service account is
 		// rejected outright, so every android send fails until the operator fixes it.
 		// SENDER_ID_MISMATCH is the one 403 that is per-token (a token minted for another
 		// Firebase project), so it falls through to be pruned below.
-		log.Printf("relay: fcm rejected the service-account credential (http %d); every android send will fail until it is fixed", resp.StatusCode)
-		return push.StatusError
+		push.LogOncePerRequest(ctx, fmt.Sprintf("fcm-credential:%d", status),
+			"relay: fcm rejected the service-account credential (http %d); every android send will fail until it is fixed", status)
+		return push.StatusRetry
 	}
-	if resp.StatusCode == http.StatusBadRequest && tokenFieldViolation(raw) {
+	if status == http.StatusBadRequest && tokenFieldViolation(raw) {
 		// Live FCM v1 reports a malformed or corrupt registration token as HTTP 400
 		// INVALID_ARGUMENT with a BadRequest field violation naming "message.token", not as
-		// the 404 UNREGISTERED the docs lead you to expect. Left unmapped this reads as
-		// StatusError (worth a retry) and the caller would resend to a token that can never
-		// succeed. A 400 from some other field - a malformed payload or message body - is a
-		// server bug and must stay StatusError.
+		// the 404 UNREGISTERED the docs lead you to expect. Left unmapped the caller would
+		// resend to a token that can never succeed. A 400 from some other field - a
+		// malformed payload or message body - is a server bug and stays rejected.
 		return push.StatusUnregistered
 	}
 	if code == "UNREGISTERED" || code == "SENDER_ID_MISMATCH" {
 		return push.StatusUnregistered
 	}
-	return push.StatusError
+	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+		return push.StatusRetry
+	}
+	return push.StatusRejected
 }
 
 // fcmErrorDetail is one entry of an FCM v1 error's "details" array. The same array carries

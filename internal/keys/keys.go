@@ -221,8 +221,20 @@ func logCeilingProgress(issued, max int64) {
 	}
 }
 
+// stampInterval is how stale a last_used_at or last_seen_at stamp may get before it is
+// written again. Each write is its own fsync'd commit on the relay's single connection, so
+// refreshing a stamp on every request and every message made the hot path pay for
+// bookkeeping nobody reads at sub-minute resolution.
+const stampInterval = time.Minute
+
 // Verify returns the key for a plaintext secret if it exists and is not revoked, stamping
-// its last-used time. Returns ErrNotFound for an unknown or revoked key.
+// its last-used time at most once per stampInterval. Returns ErrNotFound for an unknown or
+// revoked key.
+//
+// A stamp write doubles as a revocation gate: guarding it on revoked_at closes the window
+// where a revoke lands between the scan and the write. A request that skips the write
+// relies on BindTokens, which re-checks the key inside its own transaction before anything
+// is dispatched.
 func (s *Store) Verify(ctx context.Context, plain string) (*Key, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, label, created_at, last_used_at, revoked_at FROM keys WHERE key_hash = ?`,
@@ -234,11 +246,10 @@ func (s *Store) Verify(ctx context.Context, plain string) (*Key, error) {
 	if k.RevokedAt != nil {
 		return nil, ErrNotFound
 	}
-	// The stamp doubles as the revocation gate: guarding on revoked_at closes the window
-	// where a revoke lands between the scan above and this write, so a just-revoked key
-	// cannot slip one more send through, and a write failure refuses rather than trusting
-	// the possibly stale scan.
 	used := time.Now()
+	if k.LastUsedAt != nil && used.Sub(*k.LastUsedAt) < stampInterval {
+		return k, nil
+	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE keys SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`,
 		used.Unix(), k.ID)
@@ -333,14 +344,14 @@ func (s *Store) PurgeUnused(ctx context.Context, olderThan time.Duration) (int64
 	return n, nil
 }
 
-// ErrTokenLimit is returned by BindToken when a key already holds its maximum of bound tokens.
+// ErrTokenLimit is returned by BindTokens when a key already holds its maximum of bound tokens.
 var ErrTokenLimit = errors.New("keys: token limit reached")
 
-// ErrTokenKeyLimit is returned by BindToken when a token already has its maximum number of
+// ErrTokenKeyLimit is returned by BindTokens when a token already has its maximum number of
 // distinct keys bound and none of them is idle enough to make room.
 var ErrTokenKeyLimit = errors.New("keys: token key limit reached")
 
-// BindLimits are the bounds BindToken applies. A zero or negative field disables that bound.
+// BindLimits are the bounds BindTokens applies. A zero or negative field disables that bound.
 type BindLimits struct {
 	// Retention is how long a binding may go untouched by its key before pruning may drop it.
 	Retention time.Duration
@@ -353,60 +364,101 @@ type BindLimits struct {
 	BindingIdle time.Duration
 }
 
-// BindToken enforces harassment-hardening: a device push token is bound, per platform, to
-// the keys that have sent to it, and a key may deliver to a token only through its own
-// binding. Several keys may share a token, because one phone signed in to several servers
-// hands the same token to each of them; a key never gains or loses anything by another
-// key's binding, so a hostile server cannot hijack the token from a real one. The number of
-// keys per token is capped, and a full token admits a new key only by replacing a binding
-// that has been idle for lim.BindingIdle, so a hostile server cannot fill the slots and keep
-// real servers out unless it keeps every one of its keys actively sending.
+// TokenRef names one device token a key wants to deliver to.
+type TokenRef struct {
+	Platform string
+	Token    string
+}
+
+// BindToken binds one token; see BindTokens.
+func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, lim BindLimits) error {
+	errs, err := s.BindTokens(ctx, keyID, []TokenRef{{Platform: platform, Token: token}}, lim)
+	if err != nil {
+		return err
+	}
+	return errs[0]
+}
+
+// BindTokens enforces harassment-hardening for a whole batch in one transaction: a device
+// push token is bound, per platform, to the keys that have sent to it, and a key may
+// deliver to a token only through its own binding. Several keys may share a token, because
+// one phone signed in to several servers hands the same token to each of them; a key never
+// gains or loses anything by another key's binding, so a hostile server cannot hijack the
+// token from a real one. The number of keys per token is capped, and a full token admits a
+// new key only by replacing a binding that has been idle for lim.BindingIdle, so a hostile
+// server cannot fill the slots and keep real servers out unless it keeps every one of its
+// keys actively sending.
 //
-// It returns nil when keyID may deliver to the token. ErrTokenKeyLimit means the token is
-// full, ErrTokenLimit that keyID holds too many tokens, ErrNotFound that keyID was revoked.
+// It returns one error per ref, in order: nil when keyID may deliver to that token,
+// ErrTokenKeyLimit when the token is full, ErrTokenLimit when keyID holds too many tokens.
+// The returned error is ErrNotFound when keyID was revoked, in which case nothing was bound.
 //
 // A new binding is only ever written for a live key. Revoke deletes the key's bindings once,
 // so a send that was already in flight would otherwise re-create them for a revoked key.
 //
-// A legitimate send from a key always refreshes its own binding's clock, so an actively used
-// token is never at risk of pruning.
+// A legitimate send from a key refreshes its own binding's clock, at most once per
+// stampInterval, so an actively used token is never at risk of pruning.
 //
 // The read-then-write here is race-free because Open sets SetMaxOpenConns(1): the whole
 // relay shares one connection, so this transaction can never interleave with another.
-func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, lim BindLimits) error {
+func (s *Store) BindTokens(ctx context.Context, keyID int64, refs []TokenRef, lim BindLimits) ([]error, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	now := time.Now().Unix()
-	res, err := tx.ExecContext(ctx,
-		`UPDATE tokens SET last_seen_at = ? WHERE platform = ? AND token = ? AND key_id = ?`, now, platform, token, keyID)
-	if err != nil {
-		return err
+	var live int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM keys WHERE id = ? AND revoked_at IS NULL`, keyID).Scan(&live)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		if err := insertBinding(ctx, tx, keyID, platform, token, now, lim); err != nil {
-			return err
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().Unix()
+	outcomes := make([]error, len(refs))
+	for i, ref := range refs {
+		outcomes[i], err = bindOne(ctx, tx, keyID, ref, now, lim)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
 	s.maybePruneStaleTokens(ctx, lim.Retention)
-	return nil
+	return outcomes, nil
 }
 
-func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, platform, token string, now int64, lim BindLimits) error {
-	var live int
-	err := tx.QueryRowContext(ctx, `SELECT 1 FROM keys WHERE id = ? AND revoked_at IS NULL`, keyID).Scan(&live)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
+// bindOne refreshes or creates one binding. The first return is the refusal for this token
+// alone, the second a failure that must abandon the whole transaction.
+func bindOne(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int64, lim BindLimits) (refusal, fatal error) {
+	var seen int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT last_seen_at FROM tokens WHERE platform = ? AND token = ? AND key_id = ?`,
+		ref.Platform, ref.Token, keyID).Scan(&seen)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		err = insertBinding(ctx, tx, keyID, ref, now, lim)
+		if errors.Is(err, ErrTokenLimit) || errors.Is(err, ErrTokenKeyLimit) {
+			return err, nil
+		}
+		return nil, err
+	case err != nil:
+		return nil, err
+	case now-seen < int64(stampInterval.Seconds()):
+		return nil, nil
 	}
-	if err != nil {
-		return err
-	}
+	_, err = tx.ExecContext(ctx,
+		`UPDATE tokens SET last_seen_at = ? WHERE platform = ? AND token = ? AND key_id = ?`,
+		now, ref.Platform, ref.Token, keyID)
+	return nil, err
+}
+
+func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int64, lim BindLimits) error {
+	platform, token := ref.Platform, ref.Token
 	if lim.MaxPerKey > 0 {
 		var bound int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&bound); err != nil {
@@ -438,7 +490,7 @@ func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, platform, token
 			}
 		}
 	}
-	_, err = tx.ExecContext(ctx,
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
 		platform, token, keyID, now, now)
 	return err

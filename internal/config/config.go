@@ -9,7 +9,18 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
+
+// DefaultSendTimeoutSeconds is the send deadline when RELAY_SEND_TIMEOUT_SECONDS is unset.
+// It stays under the 10 seconds slim-m's server waits for a send (RELAY_TIMEOUT in
+// slimm-server's push/relay.rs), so a slow provider still gets the server per-token answers,
+// with not_attempted for what the deadline cut, instead of a request it gave up on.
+const DefaultSendTimeoutSeconds = 8
+
+// writeHeadroom is what the HTTP write timeout allows beyond the send deadline, for reading
+// the body, binding tokens and writing the response.
+const writeHeadroom = 30 * time.Second
 
 // MinAdminTokenChars is the shortest RELAY_ADMIN_TOKEN the admin endpoints will run with,
 // the same floor slim-m applies to its own listener secret.
@@ -83,11 +94,11 @@ type Config struct {
 	// since each is its own HTTP round trip to APNs or FCM.
 	SendConcurrency int
 	// SendTimeoutSeconds is the hard wall-clock deadline for one /v1/send request's provider
-	// dispatch. A message whose turn has not come by then is returned as "not_attempted"
-	// instead of holding the request open. Zero or negative disables the deadline entirely,
-	// matching the "0 or negative disables it" convention the other ceilings in this struct
-	// already use, rather than the instantly-expired context a literal zero-second timeout
-	// would otherwise produce.
+	// dispatch and the token binding before it. A message whose turn has not come by then is
+	// returned as "not_attempted" instead of holding the request open. Zero or negative
+	// disables the deadline entirely, matching the "0 or negative disables it" convention the
+	// other ceilings in this struct already use, rather than the instantly-expired context a
+	// literal zero-second timeout would otherwise produce. HTTPWriteTimeout follows it.
 	SendTimeoutSeconds int
 
 	// TokenRetentionDays bounds how long a device-token binding may go untouched before it
@@ -141,7 +152,7 @@ func Load() (Config, error) {
 		CallSendBurst:      p.int("RELAY_CALL_SEND_BURST", 5),
 		MaxMessages:        p.int("RELAY_MAX_MESSAGES", 500),
 		SendConcurrency:    p.int("RELAY_SEND_CONCURRENCY", 8),
-		SendTimeoutSeconds: p.int("RELAY_SEND_TIMEOUT_SECONDS", 20),
+		SendTimeoutSeconds: p.int("RELAY_SEND_TIMEOUT_SECONDS", DefaultSendTimeoutSeconds),
 		TokenRetentionDays: p.int("RELAY_TOKEN_RETENTION_DAYS", 90),
 		MaxTokensPerKey:    p.int("RELAY_MAX_TOKENS_PER_KEY", 20000),
 		MaxKeysPerToken:    p.int("RELAY_MAX_KEYS_PER_TOKEN", 8),
@@ -153,6 +164,16 @@ func Load() (Config, error) {
 type namedInt struct {
 	name  string
 	value int
+}
+
+// HTTPWriteTimeout is how long the HTTP server may spend answering one request. It follows
+// the send deadline so a slow batch's response is never cut off first; with the deadline
+// disabled there is nothing to follow and the write timeout is off with it.
+func (c Config) HTTPWriteTimeout() time.Duration {
+	if c.SendTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.SendTimeoutSeconds)*time.Second + writeHeadroom
 }
 
 // AdminEnabled reports whether the admin endpoints are mounted: a token is set and long

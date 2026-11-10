@@ -25,7 +25,7 @@ type sendReq struct {
 type sendMessage struct {
 	Platform string `json:"platform"` // "ios" or "android"
 	Token    string `json:"token"`
-	Kind     string `json:"kind"`    // "message", "mention", "call", "call_end", "security" or "wake"
+	Kind     string `json:"kind"`    // see parseKind for the accepted names
 	Payload  string `json:"payload"` // opaque, already-encrypted; the relay never inspects it
 }
 
@@ -50,6 +50,16 @@ type dispatchItem struct {
 	msg    push.Message
 }
 
+// pendingMessage is a message that passed validation and waits on its token binding. token
+// is the canonical form that goes to the provider, sent is the message as the caller wrote it.
+type pendingMessage struct {
+	resultIdx int
+	platform  push.Platform
+	token     string
+	kind      push.Kind
+	sent      sendMessage
+}
+
 // handleSend forwards a batch of notifications to APNs or FCM, per message, on behalf of a
 // registered server. The caller authenticates with its registration key, is rate-limited
 // per key, and gets back one result per token so it can prune tokens the provider reports
@@ -64,7 +74,7 @@ type dispatchItem struct {
 // retries only those.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if !s.sendAdmitLim.Allow(s.clientIP(r)) {
-		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+		writeRateLimited(w, s.sendAdmitLim, "rate limit exceeded")
 		return
 	}
 	plain := bearerToken(r)
@@ -83,7 +93,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.sendLim.Allow(strconv.FormatInt(k.ID, 10)) {
-		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+		writeRateLimited(w, s.sendLim, "rate limit exceeded")
 		return
 	}
 
@@ -97,8 +107,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := s.sendContext(r.Context())
+	defer cancel()
+
 	results := make([]push.Result, 0, len(req.Messages))
-	var items []dispatchItem
+	var pending []pendingMessage
+	var refs []keys.TokenRef
 
 	for _, m := range req.Messages {
 		if m.Token == "" {
@@ -106,73 +120,96 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 		platform, ok := parsePlatform(m.Platform)
 		if !ok {
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusRejected})
 			continue
 		}
 		token, ok := canonicalToken(platform, m.Token)
 		if !ok {
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusRejected})
 			continue
 		}
 		if len(m.Payload) > maxPayloadBytes {
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusRejected})
 			continue
 		}
 		kind, ok := parseKind(m.Kind)
 		if !ok {
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusRejected})
 			continue
 		}
 		if kind == push.KindCall && !s.callLim.Allow(strconv.FormatInt(k.ID, 10)) {
 			// A call rings a device, making it the most abusable kind, so it has its own,
 			// tighter per-key budget under the general send rate limit checked above.
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusRetry})
 			continue
 		}
-		err := s.keys.BindToken(r.Context(), k.ID, string(platform), token, s.bindLimits())
-		switch {
-		case errors.Is(err, keys.ErrNotFound):
-			// Revoked after Verify; nothing has been dispatched yet, so refuse the whole batch.
-			writeErr(w, http.StatusUnauthorized, "invalid or revoked key")
-			return
-		case errors.Is(err, keys.ErrTokenKeyLimit):
-			// Too many other servers already hold this token; refused like a stranger's.
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusForbidden})
-			continue
-		case errors.Is(err, keys.ErrTokenLimit):
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
-			continue
-		case err != nil:
-			log.Printf("relay: bind token: %v", err)
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
-			continue
-		}
-
-		sender := s.android
-		if platform == push.PlatformIOS {
-			sender = s.ios
-		}
-		idx := len(results)
-		results = append(results, push.Result{}) // filled in by dispatch below
-		items = append(items, dispatchItem{
-			resultIdx: idx,
-			token:     m.Token,
-			sender:    sender,
-			msg:       push.Message{Token: token, Kind: kind, Payload: m.Payload},
+		pending = append(pending, pendingMessage{
+			resultIdx: len(results), platform: platform, token: token, kind: kind, sent: m,
 		})
+		results = append(results, push.Result{}) // filled in once the binding is decided
+		refs = append(refs, keys.TokenRef{Platform: string(platform), Token: token})
 	}
 
-	s.dispatch(r.Context(), items, results)
+	outcomes, err := s.keys.BindTokens(ctx, k.ID, refs, s.bindLimits())
+	if errors.Is(err, keys.ErrNotFound) {
+		// Revoked after Verify; nothing was bound or dispatched, so refuse the whole batch.
+		writeErr(w, http.StatusUnauthorized, "invalid or revoked key")
+		return
+	}
+	if err != nil {
+		log.Printf("relay: bind tokens: %v", err)
+		outcomes = make([]error, len(refs))
+		for i := range outcomes {
+			outcomes[i] = err
+		}
+	}
+
+	var items []dispatchItem
+	for i, p := range pending {
+		switch bindErr := outcomes[i]; {
+		case bindErr == nil:
+			sender := s.android
+			if p.platform == push.PlatformIOS {
+				sender = s.ios
+			}
+			items = append(items, dispatchItem{
+				resultIdx: p.resultIdx,
+				token:     p.sent.Token,
+				sender:    sender,
+				msg:       push.Message{Token: p.token, Kind: p.kind, Payload: p.sent.Payload},
+			})
+		case errors.Is(bindErr, keys.ErrTokenKeyLimit):
+			// Too many other servers already hold this token; refused like a stranger's.
+			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusForbidden}
+		case errors.Is(bindErr, keys.ErrTokenLimit):
+			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusRejected}
+		default:
+			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusRetry}
+		}
+	}
+
+	s.dispatch(ctx, items, results)
 	// A call-kind message that never got attempted before the deadline must not have
 	// permanently spent its slice of the tighter per-key call budget: the caller is told to
 	// retry a not_attempted message, and that retry must not be silently refused because an
 	// attempt that never happened already paid for it.
 	s.refundNotAttemptedCalls(k.ID, items, results)
 
-	delivered, unregistered, forbidden, notAttempted, failed := tally(results)
-	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d not_attempted=%d error=%d",
-		k.ID, len(results), delivered, unregistered, forbidden, notAttempted, failed)
+	n := tally(results)
+	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d not_attempted=%d rejected=%d retry=%d",
+		k.ID, len(results), n[push.StatusDelivered], n[push.StatusUnregistered], n[push.StatusForbidden],
+		n[push.StatusNotAttempted], n[push.StatusRejected], n[push.StatusRetry])
 	writeJSON(w, http.StatusOK, sendResp{Results: results})
+}
+
+// sendContext bounds one request's token binding and provider dispatch by the configured
+// deadline, so the one budget covers everything the caller waits on. A deadline of zero or
+// less leaves ctx unbounded.
+func (s *Server) sendContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.cfg.SendTimeoutSeconds <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, time.Duration(s.cfg.SendTimeoutSeconds)*time.Second)
 }
 
 // bindLimits is the token-binding policy from config.
@@ -186,9 +223,9 @@ func (s *Server) bindLimits() keys.BindLimits {
 	}
 }
 
-// dispatch drains items through a bounded worker pool (concurrency from config) under a
-// hard per-request deadline (also from config), and scatters each outcome back into its
-// original slot in results. Bounding concurrency caps how many provider round trips are ever
+// dispatch drains items through a bounded worker pool (concurrency from config) under the
+// request's deadline (see sendContext), and scatters each outcome back into its original
+// slot in results. Bounding concurrency caps how many provider round trips are ever
 // in flight at once; the deadline bounds the total wall time regardless of batch size. A
 // message whose turn has not come when the deadline fires is left as push.StatusNotAttempted
 // rather than as a zero value, so the caller can tell "never tried" apart from every real
@@ -202,20 +239,14 @@ func (s *Server) bindLimits() keys.BindLimits {
 // APNs' client and FCM's HTTP send already do via http.NewRequestWithContext, and FCM's
 // oauth2 token fetch - the one call in this codebase that used to be uncancellable, since
 // oauth2.TokenSource.Token() takes no context of its own - is now bounded by ctx too (see
-// fcm.Sender.token). So "already started" only ever means "already respecting ctx.Done()",
+// fcm's tokenGate). So "already started" only ever means "already respecting ctx.Done()",
 // and finishing it takes microseconds past the deadline, not indefinitely.
 func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []push.Result) {
 	if len(items) == 0 {
 		return
 	}
-	if s.cfg.SendTimeoutSeconds > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.SendTimeoutSeconds)*time.Second)
-		defer cancel()
-	}
-	// Lets every push.Unconfigured.Send call below share one dedupe map, so a stub sender
-	// logs its rejection at most once for this request regardless of how many messages it is
-	// asked to reject one at a time.
+	// Lets every sender share one dedupe map (see push.LogOncePerRequest), so a failure every
+	// message hits is logged once for this request, however many are sent one at a time.
 	ctx = push.WithRequestScope(ctx)
 
 	workers := s.cfg.SendConcurrency
@@ -235,7 +266,7 @@ func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []p
 			for idx := range work {
 				item := items[idx]
 				out := item.sender.Send(ctx, []push.Message{item.msg})
-				status := push.StatusError
+				status := push.StatusRetry
 				if len(out) > 0 {
 					status = out[0].Status
 				}

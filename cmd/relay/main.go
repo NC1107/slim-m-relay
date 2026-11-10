@@ -67,13 +67,17 @@ func main() {
 			config.MinAdminTokenChars)
 	}
 
+	if cfg.SendTimeoutSeconds <= 0 {
+		log.Println("relay: RELAY_SEND_TIMEOUT_SECONDS is not positive; /v1/send has no deadline and the HTTP server no write timeout")
+	}
+
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Router(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      cfg.HTTPWriteTimeout(),
 		IdleTimeout:       120 * time.Second,
 	}
 

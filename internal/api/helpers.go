@@ -8,9 +8,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nc1107/slim-m-relay/internal/push"
+	"github.com/nc1107/slim-m-relay/internal/ratelimit"
 )
 
 // writeJSON renders v as a JSON response with the given status.
@@ -23,6 +26,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // writeErr renders a JSON {"error": msg} with the given status.
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeRateLimited refuses with 429 and a Retry-After for the time one of lim's tokens takes
+// to come back, so a well-behaved caller knows when to try again instead of guessing.
+func writeRateLimited(w http.ResponseWriter, lim *ratelimit.Limiter, msg string) {
+	if wait := lim.RetryAfter(); wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)))
+	}
+	writeErr(w, http.StatusTooManyRequests, msg)
 }
 
 // decodeJSON reads a JSON body up to maxBytes into v, rejecting unknown fields.
@@ -121,21 +133,12 @@ func recoverer(next http.Handler) http.Handler {
 	})
 }
 
-// tally counts delivery outcomes for logging, without touching tokens or payload content.
-func tally(results []push.Result) (delivered, unregistered, forbidden, notAttempted, failed int) {
+// tally counts delivery outcomes by status for logging, without touching tokens or payload
+// content.
+func tally(results []push.Result) map[push.Status]int {
+	counts := make(map[push.Status]int, 6)
 	for _, r := range results {
-		switch r.Status {
-		case push.StatusDelivered:
-			delivered++
-		case push.StatusUnregistered:
-			unregistered++
-		case push.StatusForbidden:
-			forbidden++
-		case push.StatusNotAttempted:
-			notAttempted++
-		default:
-			failed++
-		}
+		counts[r.Status]++
 	}
-	return
+	return counts
 }

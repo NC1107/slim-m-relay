@@ -18,7 +18,7 @@ package apns
 import (
 	"context"
 	"fmt"
-	"log"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -145,7 +145,7 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 	}
 	resp, err := s.client.PushWithContext(ctx, n)
 	if err != nil {
-		return push.StatusError
+		return push.StatusRetry
 	}
 	if resp.Sent() {
 		return push.StatusDelivered
@@ -157,10 +157,13 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 		apns2.ReasonMissingProviderToken, apns2.ReasonForbidden:
 		// Whole-pipeline credential death, not per-token noise: every send through this
 		// relay fails until the operator fixes the APNs key, so it must not log like a
-		// stale device token (which is to say, not at all).
-		log.Printf("relay: apns rejected the provider credential (reason=%s); every ios send will fail until the key is fixed", resp.Reason)
-		return push.StatusError
-	default:
-		return push.StatusError
+		// stale device token (which is to say, not at all). The message itself is fine.
+		push.LogOncePerRequest(ctx, "apns-credential:"+string(resp.Reason),
+			"relay: apns rejected the provider credential (reason=%s); every ios send will fail until the key is fixed", resp.Reason)
+		return push.StatusRetry
 	}
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+		return push.StatusRetry
+	}
+	return push.StatusRejected
 }

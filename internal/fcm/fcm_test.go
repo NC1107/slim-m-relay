@@ -66,8 +66,8 @@ func TestSendBoundsTokenFetchByContext(t *testing.T) {
 		t.Fatalf("Send took %v to return, want close to the 30ms context deadline, not blocked on "+
 			"a token fetch that never returns on its own", elapsed)
 	}
-	if len(results) != 1 || results[0].Status != push.StatusError {
-		t.Errorf("results = %+v, want a single StatusError (the token fetch never completed in time)", results)
+	if len(results) != 1 || results[0].Status != push.StatusRetry {
+		t.Errorf("results = %+v, want a single StatusRetry (the token fetch never completed in time)", results)
 	}
 }
 
@@ -165,10 +165,11 @@ func TestSendMapsPerTokenStatus(t *testing.T) {
 		// error - see the live fixture in malformedTokenBody.
 		{Token: "malformed", Status: push.StatusUnregistered},
 		// A 400 whose field violation names something other than message.token is a genuine
-		// bad request (a server bug) and must stay loud as StatusError, never swallowed into
+		// bad request (a server bug) and must stay StatusRejected, never swallowed into
 		// StatusUnregistered.
-		{Token: "badpayload", Status: push.StatusError},
-		{Token: "boom", Status: push.StatusError},
+		{Token: "badpayload", Status: push.StatusRejected},
+		// A 5xx is FCM's own trouble: the same message may go through later.
+		{Token: "boom", Status: push.StatusRetry},
 	}
 	if len(results) != len(want) {
 		t.Fatalf("got %d results, want %d", len(results), len(want))

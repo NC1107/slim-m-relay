@@ -223,3 +223,21 @@ func TestOneCallSweepsAtMostAChunkSoTheLockIsNeverHeldForAFullPass(t *testing.T)
 		t.Errorf("buckets after repeated calls = %d, want only the live one", got)
 	}
 }
+
+func TestRetryAfterIsTheTimeOneTokenTakesToRefill(t *testing.T) {
+	for _, c := range []struct {
+		perMinute float64
+		want      time.Duration
+	}{
+		{60, time.Second},
+		{120, time.Second},
+		{1, time.Minute},
+		{10, 6 * time.Second},
+		{5.0 / 60, 12 * time.Minute},
+		{0, 0},
+	} {
+		if got := New(c.perMinute, 1).RetryAfter(); got != c.want {
+			t.Errorf("%v per minute: RetryAfter = %v, want %v", c.perMinute, got, c.want)
+		}
+	}
+}
